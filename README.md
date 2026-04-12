@@ -4,7 +4,7 @@
 
 ---
 
-## 1. Setup for Modders
+## 1. Setup for Modders and Players
 To use this framework with your mod:
 
 0. Ensure you have Max Yari Lua Physics enabled.
