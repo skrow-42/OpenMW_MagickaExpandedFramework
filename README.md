@@ -43,7 +43,7 @@ I.MagExp.STACK_CONFIG.SPELL_LIMITS["shield"] = 5 -- Specific spell can stack 5 t
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-
+```lua
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -60,7 +60,7 @@ All fields except the first four are optional.
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
 | **itemRecordId**| `string` | `spellId`| Required for Items/Scrolls to handle visuals correctly. |
 | **hitObject**  | `Object`  | `nil`    | Optional priority target (e.g. from SharedRay) for Touch spells. |
-
+```
 ---
 
 ## 4. Precision Targeting: `I.SharedRay` (Player)
@@ -103,7 +103,7 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 
 ## 5. Magic Impact Events: `MagExp_OnMagicHit`
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
-
+```lua
 ### `MagicHitInfo` Data Structure
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
@@ -119,7 +119,7 @@ The framework broadcasts a global event whenever a spell (Projectile, Touch, or 
 | **isAoE**     | `boolean`    | `true` if this hit is part of a splash/area effect. |
 | **stackLimit**| `number`     | Stacking limit for this spell on this target. |
 | **stackCount**| `number`     | Current instances on target after this hit. |
-
+```
 #### Usage Example (Global Script):
 ```lua
 core.events.addHandler('MagExp_OnMagicHit', function(info)
