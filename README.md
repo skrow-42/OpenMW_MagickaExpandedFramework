@@ -1,4 +1,4 @@
-# OpenMW Magicka Expanded (OMW_MagExp) Framework Documentation
+**# OpenMW Magicka Expanded Framework v1.1**
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
@@ -43,7 +43,7 @@ I.MagExp.STACK_CONFIG.SPELL_LIMITS["shield"] = 5 -- Specific spell can stack 5 t
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-
+```
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -59,7 +59,7 @@ All fields except the first four are optional.
 | **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
 | **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
-
+```
 ---
 
 ## 4. Usage from Player/Local Scripts
@@ -84,6 +84,7 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
 
 ### `MagicHitInfo` Data Structure
+```
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
 | **attacker**  | `GameObject` | The actor who cast the spell. |
@@ -98,7 +99,7 @@ The framework broadcasts a global event whenever a spell (Projectile, Touch, or 
 | **isAoE**     | `boolean`    | `true` if this hit is part of a splash/area effect. |
 | **stackLimit**| `number`     | Stacking limit for this spell on this target. |
 | **stackCount**| `number`     | Current instances on target after this hit. |
-
+```
 #### Usage Example (Global Script):
 ```lua
 core.events.addHandler('MagExp_OnMagicHit', function(info)
@@ -136,7 +137,8 @@ I.MagExp.launchSpell({
 })
 ```
 
-### C. Restricting Stacking from another Mod
+### C. Deciding if your spell will be a stacking one or not
+This setting with given spellId will alter the vanilla behavior of spells not being able to stack. You can choose any number of stacks to be available to apply.
 ```lua
 -- In your mod's initialization
 local I = require('openmw.interfaces')
