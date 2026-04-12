@@ -37,7 +37,7 @@ I.MagExp.launchSpell({
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-
+```lua
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -53,7 +53,7 @@ All fields except the first four are optional.
 | **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
 | **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
-
+```
 ---
 
 ## 4. Usage from Player/Local Scripts
