@@ -1,4 +1,4 @@
-# OpenMW Magicka Expanded Framework Documentation
+# OpenMW Magicka Expanded (OMW_MagExp) Framework Documentation
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
@@ -37,7 +37,6 @@ I.MagExp.launchSpell({
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
 
-```
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -53,7 +52,6 @@ All fields except the first four are optional.
 | **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
 | **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
-```
 
 ---
 
