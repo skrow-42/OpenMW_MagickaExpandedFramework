@@ -1,4 +1,4 @@
-# OpenMW Magicka Expanded v1.3 Framework
+# SPELL API PLUS v1.3 Framework
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
@@ -66,7 +66,7 @@ end)
 
 ## 3. The `data` Parameter Table (for I.MagExp.launchSpell)
 All fields except the first four are optional.
-```lua
+```
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -126,7 +126,7 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 
 ## 5. Magic Impact Events: `MagExp_OnMagicHit`
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
-```lua
+```
 ### `MagicHitInfo` Data Structure
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
