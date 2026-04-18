@@ -206,3 +206,9 @@ core.sendGlobalEvent('MagExp_BreakInvisibility', { actor = myPlayer })
 - **Dynamic Spawning:** Providing a `spawnOffset` (e.g. `10`) prevents projectiles from spawning "inside" actors when at point-blank range.
 - **Auto-Detection:** MagExp parses spell records to assign school-accurate visuals and sounds automatically.
 - **Safety:** Uses persistent `Colony_Assassin_act` carrier objects for maximum compatibility.
+
+
+**CREDITS:
+Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place
+Credits to MaxYari for his Lua Physics engine
+Credits to all of the users supporting me in the OpenMW Discord**
