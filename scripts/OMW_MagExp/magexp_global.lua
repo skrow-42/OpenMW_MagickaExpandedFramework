@@ -16,10 +16,34 @@ local core    = require('openmw.core')
 local types   = require('openmw.types')
 local util    = require('openmw.util')
 local storage = require('openmw.storage')
+local I       = require('openmw.interfaces')
+local async   = require('openmw.async')
 
-local targetFilter = nil
-local activeVfxRegistry = {} 
-local casterLinkedSpells = {} -- list of {caster, target, spellId} for casterLinked effects
+local activeVfxRegistry      = {}
+local projectileItemRegistry = {} -- [proj.id] = live item object, kept until projectile dies
+local casterLinkedSpells     = {} -- list of {caster, target, spellId} for casterLinked effects
+local customFilters          = {}
+local trackedEffectRegistry  = {}
+
+--- Internal unified target validator.
+--- Checks for basic validity (exists, is not a corpse) and then runs all registered custom filters.
+local function checkTarget(target)
+    if not target or not target:isValid() then return false end
+    
+    -- Default Veto: Don't affect dead actors (unless specific resurrection/necromancy logic exists)
+    if types.Actor.objectIsInstance(target) then
+        if types.Actor.isDead(target) then
+            return false
+        end
+    end
+
+    -- Run custom filters from other mods
+    for _, filter in ipairs(customFilters) do
+        if not filter(target) then return false end
+    end
+
+    return true
+end
 
 local function debugLog(msg)
     local debugOn = storage.globalSection('SettingsMagExp_General'):get('DebugMode')
@@ -84,13 +108,15 @@ local function fireMagicHitEvent(data)
         hitPos       = data.hitPos,
         hitNormal    = data.hitNormal or util.vector3(0,0,1),
         successful   = true,
-        sourceType   = core.magic.ATTACK_SOURCE_TYPE and core.magic.ATTACK_SOURCE_TYPE.Magic or 2, -- AttackSourceType.Magic = 2
+        sourceType   = (I.Combat and I.Combat.AttackSourceType) and I.Combat.AttackSourceType.Magic or (core.magic.ATTACK_SOURCE_TYPE and core.magic.ATTACK_SOURCE_TYPE.Magic or 2),
         spellType    = data.spellType or core.magic.RANGE.Target,
         isAoE        = data.isAoE or false,
         area         = data.area or 0,
         damage       = getSpellDamageInfo(data.spellId),
         projectile   = data.projectile,
-        velocity     = data.velocity or util.vector3(0,0,0)
+        velocity     = data.velocity or util.vector3(0,0,0),
+        unreflectable = data.unreflectable or false,
+        casterLinked = data.casterLinked or false
     }
 
     -- Element & School detection
@@ -123,7 +149,8 @@ local function fireMagicHitEvent(data)
 
     -- Broadcast globally
     core.sendGlobalEvent('MagExp_OnMagicHit', info)
-    -- Send to target script if actor
+
+    -- Send to target (local script) if actor
     if data.target and data.target:isValid() then
         data.target:sendEvent('MagExp_Local_MagicHit', info)
 
@@ -153,14 +180,29 @@ local function fireMagicHitEvent(data)
     end
 end
 
+--- Internal dispatcher for effect lifecycle events.
+--- Fires both the public interface callback and a global event.
+local function fireEffectEvent(eventName, actor, effect)
+    if MagExpPublicInterface and MagExpPublicInterface[eventName] then
+        pcall(function() MagExpPublicInterface[eventName](actor, effect) end)
+    end
+    core.sendGlobalEvent('MagExp_' .. eventName:sub(1,1):upper() .. eventName:sub(2), { actor = actor, effect = effect })
+end
+
 -- ============================================================
 -- [CORE] Authoritative Spell Application
 -- ============================================================
-local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject)
+local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked)
     if not target or not target:isValid() then return end
     if not (caster and caster:isValid()) then caster = target end
     if target.type ~= types.NPC and target.type ~= types.Creature and target.type ~= types.Player then
         debugLog("applySpellToActor: Aborting - target is not an actor type")
+        return
+    end
+
+    -- [DEAD ACTOR GATE] Must be first — before any VFX/sounds fire on the target
+    if not checkTarget(target) then
+        debugLog("[MagExp] Target Vetoed (dead or filtered): " .. tostring(target.recordId or target.id))
         return
     end
 
@@ -180,7 +222,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
 
     -- Check for harmful and casterLinked flags
     local hasHarmful = false
-    local hasCasterLinked = false
+    local hasCasterLinked = casterLinked or false
     if spell.effects then
         for _, eff in ipairs(spell.effects) do
             print("MagExp: Checking effect " .. eff.id)
@@ -256,13 +298,6 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
 
     debugLog(string.format("Applying %s to %s", spellId, target.recordId or target.id))
 
-    -- [MOD-SIDE VETO] Allow other mods (like OSSC) to block hits (made to not affect corpses)
-    if targetFilter and not targetFilter(target) then
-        print("[MagExp] Target Blocked by Veto Filter: " .. tostring(target.recordId or target.id))
-        debugLog("applySpellToActor: Blocked by targetFilter")
-        return
-    end
-
     -- BROADCAST HIT EVENT (For Self/Touch spells that don't go through projectile logic)
     -- If isAoe is true, it means it's being applied via detonateSpellAtPos
     if not isAoe and spell and spell.effects and spell.effects[1] then
@@ -275,13 +310,17 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                 hitPos    = hitPos or target.position,
                 spellType = r,
                 isAoE     = false,
-                area      = spell.effects[1].area or 0
+                area      = spell.effects[1].area or 0,
+                unreflectable = unreflectable or false
             })
         end
     end
 
-    local effectIndexes = {}
-    if spell.effects then
+    -- [FIX] Treat an empty table the same as nil so activeSpells:add always
+    -- receives a populated list (or none at all, letting the engine use defaults).
+    local effectIndexes = (forcedEffects and #forcedEffects > 0) and forcedEffects or nil
+    if not effectIndexes and spell.effects then
+        effectIndexes = {}
         for i, _ in ipairs(spell.effects) do
             table.insert(effectIndexes, i - 1)
         end
@@ -299,7 +338,19 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             -- Apply effects
             if isEnchantment then
                 -- Provide the item source for mods that need it (like OSSC)
-                if itemObject and itemObject:isValid() then params.item = itemObject end
+                if type(itemObject) == "string" and caster and caster:isValid() then
+                    -- Resolve recordId string to a real item proxy if possible
+                    pcall(function()
+                        local inv = types.Actor.inventory(caster)
+                        local found = inv:find(itemObject)
+                        if found then itemObject = found end
+                    end)
+                end
+
+                if itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
+                    params.item = itemObject
+                    params.id   = itemObject.recordId -- Recommended by OMW patterns for correct UI/Engine mapping
+                end
                 pcall(function() activeSpells:add(params) end)
             else
                 local isStackable = false
@@ -312,16 +363,52 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             local effCount = spell.effects and #spell.effects or 0
             debugLog(string.format("Successfully added %s (%d effect(s))", spellId, effCount))
 
+            -- [TRACKING] Register spell for lifecycle events
+            if not trackedEffectRegistry[target.id] then trackedEffectRegistry[target.id] = {} end
+            local trackingData = {
+                caster    = caster,
+                startTime = core.getSimulationTime(),
+                effects   = {}
+            }
+            if spell.effects then
+                for _, idx in ipairs(effectIndexes) do
+                    local rawEff = spell.effects[idx + 1]
+                    if rawEff then
+                        local effInfo = {
+                            id        = rawEff.id,
+                            spellId   = spellId,
+                            index     = idx,
+                            magnitude = math.random(rawEff.magnitudeMin or 0, rawEff.magnitudeMax or rawEff.magnitudeMin or 0),
+                            duration  = rawEff.duration or 0,
+                            caster    = caster,
+                            unreflectable = unreflectable or false,
+                            casterLinked  = hasCasterLinked
+                        }
+                        table.insert(trackingData.effects, effInfo)
+                        fireEffectEvent('onEffectApplied', target, effInfo)
+                    end
+                end
+            end
+            trackedEffectRegistry[target.id][spellId] = trackingData
+
             -- Handle harmful effects: elicit hostile reaction
             if hasHarmful and types.NPC.objectIsInstance(target) then
                 print("MagExp: Triggering hostile reaction on " .. target.recordId .. " from " .. (caster.recordId or "unknown"))
+                
+                local sourceType = 'Magic'
+                local attackType = 'Thrust'
+                if I.Combat then
+                    if I.Combat.AttackSourceType then sourceType = I.Combat.AttackSourceType.Magic end
+                    if I.Combat.AttackType then attackType = I.Combat.AttackType.Thrust end
+                end
+
                 local attackInfo = {
                     attacker = caster,
                     damage = {health = 0},
                     successful = true,
-                    sourceType = 'Magic',
+                    sourceType = sourceType,
                     strength = 1.0,
-                    type = 'Thrust'
+                    type = attackType
                 }
                 local ok, err = pcall(function() target:sendEvent('Hit', attackInfo) end)
                 if not ok then print("MagExp: sendEvent Hit failed: " .. tostring(err)) end
@@ -347,8 +434,8 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                     zOffset = 45 -- Lowered fallback significantly (waist level)
                     pcall(function()
                         local bbox = target:getBoundingBox()
-                        if bbox and bbox.min and bbox.max then
-                            zOffset = (bbox.max.z - bbox.min.z) * 0.55
+                        if bbox then
+                            zOffset = bbox.halfSize.z * 1.1 -- Roughly 0.55 of full height
                             if zOffset > 105 then zOffset = 65 end
                         end
                     end)
@@ -394,20 +481,25 @@ end
 -- [UTILITY] Door lock/unlock handling
 -- ============================================================
 local function handleDoorLockUnlock(spellId, caster, target)
-    if not target or target.type ~= types.Door then return false end
+    local isLockable = (target and (target.type == types.Door or target.type == types.Container))
+    if not isLockable then return false end
+    
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell or not spell.effects then return false end
 
     for _, eff in ipairs(spell.effects) do
-        if eff.id == "open" or eff.id == "lock" then
+        local eid = tostring(eff.id):lower()
+        if eid == "open" or eid == "lock" then
             local magnitude = math.random(eff.magnitudeMin or 0, eff.magnitudeMax or eff.magnitudeMin or 0)
-            if types.Lockable and types.Lockable.objectIsInstance(target) then
+            -- print(string.format("[MagExp] Interaction: EID=%s, Mag=%d", eid, magnitude))
+            if types.Lockable then
                 local isLocked = types.Lockable.isLocked(target)
                 local lockLvl = 0
                 if types.Lockable.getLockLevel then lockLvl = types.Lockable.getLockLevel(target)
                 elseif types.Lockable.lockLevel then lockLvl = types.Lockable.lockLevel(target) end
+                -- print(string.format("[MagExp] Target: %s, Locked: %s, LockLvl: %d", target.recordId, tostring(isLocked), lockLvl))
 
-                if eff.id == "open" then
+                if eid == "open" then
                     if isLocked and magnitude >= lockLvl then
                         types.Lockable.unlock(target)
                         pcall(function() core.sound.playSound3d("Open Lock", target) end)
@@ -416,7 +508,7 @@ local function handleDoorLockUnlock(spellId, caster, target)
                         pcall(function() core.sound.playSound3d("Open Lock Fail", target) end)
                         pcall(function() core.sound.playSound3d("alteration hit", target) end)
                     end
-                elseif eff.id == "lock" then
+                elseif eid == "lock" then
                     if not isLocked or magnitude > lockLvl then
                         types.Lockable.lock(target, magnitude)
                         pcall(function() core.sound.playSound3d("Open Lock", target) end)
@@ -438,7 +530,7 @@ end
 -- ============================================================
 -- [AOE] Detonate spell at world position
 -- ============================================================
-local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject)
+local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked)
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell or not spell.effects then return end
 
@@ -471,8 +563,13 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject)
     end
 
     local isLockUnlock = false
-    for _, eff in ipairs(spell.effects) do
-        if eff.id == "open" or eff.id == "lock" then isLockUnlock = true; break end
+    if spell.effects then
+        for _, eff in ipairs(spell.effects) do
+            local eid = tostring(eff.id):lower()
+            if eid == "open" or eid == "lock" or eid == "disarmtrap" or eid == "absorbtrap" then 
+                isLockUnlock = true; break 
+            end
+        end
     end
 
     if cell then
@@ -480,28 +577,30 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject)
         for _, object in ipairs(cell:getAll()) do
             if object:isValid() then
                 local dist = 0
+                -- Fast distance check
                 pcall(function() dist = (object.position - pos):length() end)
                 if dist and dist <= finalRadius then
-                    if isLockUnlock then
-                        if object.type == types.Door then
-                            handleDoorLockUnlock(spellId, caster, object)
-                            affectedCount = affectedCount + 1
-                        end
-                    else
-                        if object.type == types.NPC or object.type == types.Creature or object.type == types.Player then
-                            applySpellToActor(spellId, caster, object, pos, true, itemObject)
-                            -- Broadcast AoE hit
-                            fireMagicHitEvent({
-                                attacker  = caster,
-                                target    = object,
-                                spellId   = spellId,
-                                hitPos    = pos,
-                                spellType = core.magic.RANGE.Target,
-                                isAoE     = true,
-                                area      = finalRadius
-                            })
-                            affectedCount = affectedCount + 1
-                        end
+                    local isLockable = (object.type == types.Door or object.type == types.Container)
+                    local isActor    = (object.type == types.NPC or object.type == types.Creature or object.type == types.Player)
+
+                    if isLockUnlock and isLockable then
+                        handleDoorLockUnlock(spellId, caster, object)
+                        affectedCount = affectedCount + 1
+                    elseif isActor and not isLockUnlock and not (types.Actor.objectIsInstance(object) and types.Actor.isDead(object)) then
+                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked)
+                        -- Broadcast AoE hit
+                        fireMagicHitEvent({
+                            attacker  = caster,
+                            target    = object,
+                            spellId   = spellId,
+                            hitPos    = pos,
+                            spellType = core.magic.RANGE.Target,
+                            isAoE     = true,
+                            area      = finalRadius,
+                            unreflectable = unreflectable,
+                            casterLinked = casterLinked
+                        })
+                        affectedCount = affectedCount + 1
                     end
                 end
             end
@@ -677,19 +776,45 @@ local function launchSpell(data)
     routingType = routingType or core.magic.RANGE.Target
     area  = area  or 0
 
+    -- Split effects by range: Self effects apply immediately to caster
+    local selfIndexes = {}
+    local otherIndexes = {}
+    if spell.effects then
+        for i, eff in ipairs(spell.effects) do
+            if eff.range == core.magic.RANGE.Self then
+                table.insert(selfIndexes, i - 1)
+            else
+                table.insert(otherIndexes, i - 1)
+            end
+        end
+    end
+
+    -- [SPLIT-RANGE APPLICATION]
+    -- If there are Self effects and we are doing a non-Self routing, apply Self parts to attacker now.
+    if #selfIndexes > 0 and routingType ~= core.magic.RANGE.Self then
+        debugLog(string.format("Splitting %d Self effects from %s", #selfIndexes, spellId))
+        applySpellToActor(spellId, attacker, attacker, nil, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked)
+        
+        -- If no non-Self effects remain, we're done.
+        if #otherIndexes == 0 then return end
+    end
+
+    -- If we have other effects, use them for the subsequent routing
+    local effectIndexes = #otherIndexes > 0 and otherIndexes or nil
+
     -- ---- SELF ----
     if routingType == core.magic.RANGE.Self then
         local zOffset = 95
         pcall(function()
             local bbox = attacker:getBoundingBox()
-            if bbox and bbox.min and bbox.max then
-                zOffset = (bbox.max.z - bbox.min.z) * 0.5
+            if bbox then
+                zOffset = bbox.halfSize.z
                 if zOffset > 105 then zOffset = 100 end
             end
         end)
         local torsoPos = attacker.position + util.vector3(0, 0, zOffset)
-        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject) end
-        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject)
+        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked) end
+        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked)
         return
     end
 
@@ -704,43 +829,56 @@ local function launchSpell(data)
             local spellIsLockUnlock = false
             if spell.effects then
                 for _, eff in ipairs(spell.effects) do
-                    if eff.id == "open" or eff.id == "lock" then spellIsLockUnlock = true end
+                    local eid = tostring(eff.id):lower()
+                    if eid == "open" or eid == "lock" or eid == "disarmtrap" or eid == "absorbtrap" then 
+                        spellIsLockUnlock = true 
+                    end
                 end
             end
 
-            local validTarget = false
-            if spellIsLockUnlock then
-                if obj.type == types.Door then validTarget = true end
-            else
-                if obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player then validTarget = true end
-            end
+            local isLockable = (obj.type == types.Door or obj.type == types.Container)
+            local isActor    = (obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player)
+
+            local validTarget = (isLockable or isActor)
 
             if validTarget then
-                if spellIsLockUnlock then
-                    handleDoorLockUnlock(spellId, attacker, obj)
-                else
+                local hitPos = obj.position
+                if isActor then
                     local zOffset = 95
                     pcall(function()
-                        local bbox = obj:getBoundingBox()
-                        if bbox and bbox.min and bbox.max then
-                            zOffset = (bbox.max.z - bbox.min.z) * 0.5
-                            if zOffset > 105 then zOffset = 100 end
-                        end
+                    local bbox = obj:getBoundingBox()
+                    if bbox then
+                        zOffset = bbox.halfSize.z
+                        if zOffset > 105 then zOffset = 100 end
+                    end
                     end)
-                    local torsoPos = obj.position + util.vector3(0, 0, zOffset)
-                    if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, obj.cell, itemObject) end
-                    applySpellToActor(spellId, attacker, obj, torsoPos, false, itemObject)
+                    hitPos = obj.position + util.vector3(0, 0, zOffset)
+                end
 
-                    -- [VFX FOR TOUCH] Manually trigger hit visuals since there is no projectile collision
+                if spellIsLockUnlock then
+                    -- Use authoritative interaction handler for Lock/Unlock/Disarm
+                    handleDoorLockUnlock(spellId, attacker, obj)
+                elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
+                    if area > 0 then detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked) end
+                    applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked)
+                end
+
+                -- [VFX FOR TOUCH] Only for valid targets
+                -- If it's a Lock spell, only trigger VFX for Lockables. If it's a normal spell, for Actors.
+                local isProperTarget = (spellIsLockUnlock and isLockable) or (not spellIsLockUnlock and isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)))
+                
+                if isProperTarget then
                     fireMagicHitEvent({
                         attacker   = attacker,
                         target     = obj,
                         spellId    = spellId,
                         itemObject = itemObject,
-                        hitPos     = torsoPos,
+                        hitPos     = hitPos,
                         isAoE      = false,
                         area       = area,
-                        spellType  = core.magic.RANGE.Touch
+                        spellType  = core.magic.RANGE.Touch,
+                        unreflectable = data.unreflectable,
+                        casterLinked = data.casterLinked
                     })
                 end
                 return
@@ -787,6 +925,20 @@ local function launchSpell(data)
     local proj = world.createObject(recordId, 1)
     proj:teleport(attacker.cell, spawnPos, rotation)
 
+    -- [FIX] Store the live item object in a registry keyed by projectile ID.
+    -- Passing itemObject.recordId (a string) loses the live object reference, which
+    -- prevents activeSpells:add from receiving the correct params.item field for
+    -- enchantment projectiles.  The registry is cleared on collision or expiry.
+    local itemRecordId = nil
+    if itemObject then
+        if type(itemObject) == "string" then
+            itemRecordId = itemObject
+        else
+            itemRecordId = itemObject.recordId
+            projectileItemRegistry[proj.id] = itemObject
+        end
+    end
+
     local function safeAddScript(obj, path)
         local ok = pcall(function() obj:addScript(path) end)
         if not ok then
@@ -797,7 +949,12 @@ local function launchSpell(data)
     end
 
     safeAddScript(proj, 'scripts/OMW_MagExp/magexp_projectile_local.lua')
-    proj:sendEvent('MagExp_InitProjectile', {
+
+    -- [FIX] Defer MagExp_InitProjectile by one simulation tick.
+    -- addScript() schedules the script for attachment on the NEXT engine update; if
+    -- sendEvent is called immediately in the same frame the event arrives before
+    -- onInit runs, producing an inert projectile with no velocity or spellId.
+    local initPayload = {
         -- Physics
         velocity    = dir * speed,
         maxLifetime = maxLifetime,
@@ -805,7 +962,8 @@ local function launchSpell(data)
         -- Identity
         attacker    = attacker,
         spellId     = spellId,
-        itemRecordId = itemObject and itemObject.recordId or nil,
+        itemRecordId = itemRecordId,
+        effectIndexes = effectIndexes,
         area        = area,
         -- Audio
         boltSound   = boltSound,
@@ -816,7 +974,14 @@ local function launchSpell(data)
         hitModel    = hitModel,
         vfxRecId    = vfxRecId,
         particle    = particleTex,
-    })
+        unreflectable = data.unreflectable,
+        casterLinked  = data.casterLinked,
+    }
+    async:newUnsavableSimulationTimer(0, function()
+        if proj and proj:isValid() then
+            proj:sendEvent('MagExp_InitProjectile', initPayload)
+        end
+    end)
 
     debugLog(string.format("Launched '%s' [%s] spd=%d spin=%.2f", tostring(spellId), tostring(recordId), speed, spinSpeed))
 end
@@ -847,6 +1012,8 @@ local function onProjectileExpired(data)
         proj:sendEvent('MagExp_StopSound')
         pcall(function() proj:remove() end)
     end
+    -- [FIX] Clean up item registry entry so we don't leak item references
+    if proj and proj.id then projectileItemRegistry[proj.id] = nil end
     if data.soundAnchor and data.soundAnchor:isValid() then pcall(function() data.soundAnchor:remove() end) end
     if data.lightAnchor and data.lightAnchor:isValid() then pcall(function() data.lightAnchor:remove() end) end
 end
@@ -855,10 +1022,13 @@ local function onProjectileCollision(data)
     local proj     = data.projectile
     local attacker = data.attacker
     local spellId  = data.spellId
-    local itemRecordId = data.itemRecordId
     local target   = data.hitObject
     local hitPos   = data.hitPos
     local area     = data.area or 0
+
+    -- [FIX] Prefer the live item object from the registry; fall back to record ID string
+    local itemRecordId = (proj and proj.id and projectileItemRegistry[proj.id]) or data.itemRecordId
+    if proj and proj.id then projectileItemRegistry[proj.id] = nil end
 
     if not attacker or not spellId or not hitPos then
         debugLog("ProjectileCollision: missing data")
@@ -871,18 +1041,28 @@ local function onProjectileCollision(data)
     local spellIsLockUnlock = false
     if spell and spell.effects then
         for _, eff in ipairs(spell.effects) do
-            if eff.id == "open" or eff.id == "lock" then spellIsLockUnlock = true end
+            local eid = tostring(eff.id):lower()
+            if eid == "open" or eid == "lock" or eid == "disarmtrap" or eid == "absorbtrap" then 
+                spellIsLockUnlock = true 
+            end
         end
     end
 
+    local effectIndexes = data.effectIndexes
     if spellIsLockUnlock then
-        if target and target.type == types.Door then handleDoorLockUnlock(spellId, attacker, target)
-        elseif area > 0 then detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId) end
+        local isLockable = (target and (target.type == types.Door or target.type == types.Container))
+        -- print(string.format("[MagExp] Collision: %s on %s. Lockable: %s", spellId, target and target.recordId or "nothing", tostring(isLockable)))
+        if isLockable then 
+            handleDoorLockUnlock(spellId, attacker, target)
+        elseif area > 0 then detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked) end
     else
         if area > 0 then
-            detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId)
-        elseif target and (tostring(target.type):find("NPC") or tostring(target.type):find("Creature") or tostring(target.type):find("Player")) then
-            applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId)
+            detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked)
+        elseif target and target:isValid() and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) and not spellIsLockUnlock and
+               (types.NPC.objectIsInstance(target) or
+                types.Creature.objectIsInstance(target) or
+                types.Player.objectIsInstance(target)) then
+            applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked)
         end
     end
 
@@ -897,7 +1077,9 @@ local function onProjectileCollision(data)
         projectile = proj,
         spellType  = core.magic.RANGE.Target,
         isAoE      = false,
-        area       = area
+        area       = area,
+        unreflectable = data.unreflectable,
+        casterLinked = data.casterLinked
     })
 
     if proj and proj:isValid() then
@@ -955,6 +1137,45 @@ local function onUpdate(dt)
             if not anyRemaining then activeVfxRegistry[targetId] = nil end
         end
 
+        -- [LIFECYCLE TRACKING] onEffectTick & onEffectOver
+        for targetId, spells in pairs(trackedEffectRegistry) do
+            local target = world.getObjectById(targetId)
+            if not target or not target:isValid() or (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
+                -- Actor is gone or dead: Fire onEffectOver for all tracked spells
+                for spellId, data in pairs(spells) do
+                    for _, eff in ipairs(data.effects) do
+                        fireEffectEvent('onEffectOver', target, eff)
+                    end
+                end
+                trackedEffectRegistry[targetId] = nil
+            else
+                local activeSpells = types.Actor.activeSpells(target)
+                for spellId, data in pairs(spells) do
+                    local isActive = false
+                    if activeSpells then
+                        for sId, _ in pairs(activeSpells) do
+                            if sId == spellId then isActive = true; break end
+                        end
+                    end
+
+                    if not isActive then
+                        -- Spell has expired or been removed
+                        for _, eff in ipairs(data.effects) do
+                            fireEffectEvent('onEffectOver', target, eff)
+                        end
+                        spells[spellId] = nil
+                    else
+                        -- Still active: Fire onEffectTick
+                        for _, eff in ipairs(data.effects) do
+                            fireEffectEvent('onEffectTick', target, eff)
+                        end
+                    end
+                end
+                -- Clean up empty target entries
+                if next(spells) == nil then trackedEffectRegistry[targetId] = nil end
+            end
+        end
+
         -- [CASTER LINKED CLEANUP] Remove casterLinked spells if caster dies
         for i = #casterLinkedSpells, 1, -1 do
             local link = casterLinkedSpells[i]
@@ -963,8 +1184,7 @@ local function onUpdate(dt)
             if not caster or not caster:isValid() then
                 isCasterDead = true
             elseif types.Actor.objectIsInstance(caster) then
-                local health = types.Actor.stats.dynamic.health(caster)
-                if health and health.current <= 0 then
+                if types.Actor.isDead(caster) then
                     isCasterDead = true
                 end
             end
@@ -985,35 +1205,47 @@ end
 -- ============================================================
 -- PUBLIC INTERFACE + ENGINE HANDLERS
 -- ============================================================
+--- Public interface implementation
+local MagExpPublicInterface = {
+    --- Version of the OMW_MagExp framework.
+    version = 1.0,
+
+    --- Launch a spell projectile (or apply Self/Touch immediately).
+    -- @param data table: { attacker, spellId, startPos, direction, isFree?, speed? }
+    launchSpell = launchSpell,
+
+    --- Apply spell effects directly to an actor.
+    -- @param spellId string, caster Actor, target Actor, hitPos vector3, isAoe boolean, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean
+    applySpellToActor = applySpellToActor,
+
+    --- Register an effect ID to use persistent looping visuals (e.g. Shield).
+    -- @param effectId string
+    registerPersistentEffect = function(id)
+        if id then STACK_CONFIG.PERSISTENT_EFFECTS[id:lower()] = true end
+    end,
+
+    --- Trigger an AoE blast at a world position.
+    -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean
+    detonateSpellAtPos = detonateSpellAtPos,
+
+    --- Register a custom target filter. Returns true/false to allow/block hits.
+    addTargetFilter = function(f) table.insert(customFilters, f) end,
+    -- Deprecated but kept for backward compatibility:
+    setTargetFilter = function(f) table.insert(customFilters, f) end,
+    STACK_CONFIG = STACK_CONFIG,
+
+    --- Lifecycle hooks (to be overridden by other mods)
+    onEffectApplied = function(actor, effect) end,
+    onEffectTick    = function(actor, effect) end,
+    onEffectOver    = function(actor, effect) end,
+}
+
+-- ============================================================
+-- PUBLIC INTERFACE + ENGINE HANDLERS
+-- ============================================================
 return {
     interfaceName = "MagExp",
-    interface = {
-        --- Version of the OMW_MagExp framework.
-        version = 1.0,
-
-        --- Launch a spell projectile (or apply Self/Touch immediately).
-        -- @param data table: { attacker, spellId, startPos, direction, isFree?, speed? }
-        launchSpell = launchSpell,
-
-        --- Apply spell effects directly to an actor.
-        -- @param spellId string, caster Actor, target Actor, hitPos vector3
-        applySpellToActor = applySpellToActor,
-
-        --- Register an effect ID to use persistent looping visuals (e.g. Shield).
-        -- @param effectId string
-        registerPersistentEffect = function(id)
-            if id then STACK_CONFIG.PERSISTENT_EFFECTS[id:lower()] = true end
-        end,
-
-        --- Trigger an AoE blast at a world position.
-        -- @param spellId string, caster Actor, pos vector3, cell Cell
-        detonateSpellAtPos = detonateSpellAtPos,
-
-        --- Stacking configuration table. Modders can modify this at runtime.
-        applySpell   = applySpellToActor,
-        setTargetFilter = function(f) targetFilter = f end,
-        STACK_CONFIG = STACK_CONFIG,
-    },
+    interface = MagExpPublicInterface,
     engineHandlers = {
         onUpdate = onUpdate,
     },

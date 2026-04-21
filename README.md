@@ -83,7 +83,7 @@ The framework detects the magic school and element (Fire, Frost, Shock, Poison) 
 
 ## 4. The `data` Parameter Table
 All fields except the first four are optional.
-```
+
 | Parameter      | Type      | Default  | Description |
 | :---           | :---      | :---     | :--- |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
@@ -102,7 +102,7 @@ All fields except the first four are optional.
 | **itemObject** | `Object`  | `nil`    | Source item (for correct enchantment logic). |
 | **hitObject**  | `Object`  | `nil`    | Priority target for authoritative hits. |
 | **unreflectable** | `boolean` | `false`  | If true, the hit/effect cannot be reflected. |
-```
+
 ---
 
 ## 5. Precision Targeting: `I.SharedRay` (Player)
@@ -147,7 +147,6 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target.
 
 ### `MagicHitInfo` Data Structure
-```
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
 | **attacker**  | `GameObject` | The actor who cast the spell. |
@@ -163,7 +162,7 @@ The framework broadcasts a global event whenever a spell (Projectile, Touch, or 
 | **stackLimit**| `number`     | Stacking limit for this spell on this target. |
 | **stackCount**| `number`     | Current instances on target after this hit. |
 | **unreflectable**| `boolean`    | `true` if the spell cannot be reflected. |
-```
+
 ---
 
 ## 8. Effect Lifecycle Events (New in 1.6)
@@ -184,7 +183,6 @@ Alternatively, listen for these events from any script:
 - `MagExp_OnEffectOver`
 
 ### `EffectInfo` Structure
-```
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
 | **id**        | `string`     | The Magic Effect Record ID (e.g. "fire damage"). |
@@ -194,7 +192,7 @@ Alternatively, listen for these events from any script:
 | **duration**  | `number`     | Remaining duration (or total if applied). |
 | **caster**    | `GameObject` | The actor who applied the effect. |
 | **unreflectable**| `boolean`    | `true` if the effect cannot be reflected. |
-```
+
 ---
 
 ## 9. Examples
@@ -249,3 +247,12 @@ core.sendGlobalEvent('MagExp_BreakInvisibility', { actor = myPlayer })
 - **Dynamic Spawning:** Providing a `spawnOffset` prevents projectiles from spawning "inside" actors.
 - **Auto-Detection:** SpellFrameworkPlus parses spell records to assign school-accurate visuals and sounds automatically.
 - **Safety:** Uses persistent `Colony_Assassin_act` carrier objects for maximum compatibility.
+
+
+
+
+CREDITS:
+Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place
+Credits to MaxYari for his Lua Physics engine
+Credits to hyacinth and ownlyme for SharedRay lib
+Credits to all of the users supporting me in the OpenMW Discord

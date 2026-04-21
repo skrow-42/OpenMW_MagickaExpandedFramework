@@ -11,6 +11,7 @@ local nearby = require('openmw.nearby')
 local core   = require('openmw.core')
 local util   = require('openmw.util')
 local anim   = require('openmw.animation')
+local types  = require('openmw.types')
 
 local velocity     = nil
 local attacker     = nil
@@ -27,6 +28,7 @@ local currentRotation = nil
 local rotSpinLog   = 0
 local spinSpeed    = 0
 local boltVfxHandle = nil
+local effectIndexes = nil
 local isProjectile = false
 
 local function stopSound()
@@ -63,6 +65,7 @@ local function onInit(data)
         currentRotation = self.rotation
         spinSpeed       = data.spinSpeed or 0
         maxLifetime     = data.maxLifetime or 10
+        effectIndexes   = data.effectIndexes or nil
         if spinSpeed > 0 then isRotating = true end
 
         if data.boltModel and data.boltModel ~= "" then
@@ -105,6 +108,36 @@ local function onInit(data)
     end
 end
 
+local function onObjectCollision(other)
+    if not isProjectile or hasCollided or not velocity then return end
+    if other == attacker then return end
+
+    -- [PHYSICAL ACTOR COLLISION]
+    -- User requested non-ray based actor detection. 
+    -- This relies on the engine's collision volume.
+    if other and other:isValid() then
+        if types.Actor.objectIsInstance(other) then
+            if types.Actor.isDead(other) then return end -- Pass through dead bodies
+            
+            hasCollided = true
+            stopSound()
+            core.sendGlobalEvent('MagExp_ProjectileCollision', {
+                projectile  = self,
+                hitObject   = other,
+                hitPos      = self.position,
+                hitNormal   = (self.position - other.position):normalize(),
+                velocity    = velocity,
+                attacker    = attacker,
+                spellId     = spellId,
+                area        = area,
+                effectIndexes = effectIndexes,
+                soundAnchor = soundAnchor,
+                lightAnchor = lightAnchor
+            })
+        end
+    end
+end
+
 local function onUpdate(dt)
     if not isProjectile or hasCollided or not velocity then return end
 
@@ -131,8 +164,28 @@ local function onUpdate(dt)
     local from = self.position
     local to   = from + velocity * dt
 
-    local hit = nearby.castRay(from, to, { ignore = { self, attacker } })
+    -- [FIX] Cast the ray 2x further than the per-frame step (lookahead).
+    -- Fast projectiles can skip entirely past thin collision meshes in one frame;
+    -- the extended ray catches those targets. The projectile still moves to `to`,
+    -- not the end of the lookahead, so there is no visual teleport.
+    local lookAheadEnd = from + velocity * dt * 2.0
+    local hit = nearby.castRay(from, lookAheadEnd, { ignore = { self, attacker } })
     if hit.hit then
+        -- [DEAD ACTOR PASS-THROUGH] Skip corpses — physics mesh stays active during death animation
+        if hit.hitObject and hit.hitObject:isValid() and types.Actor.objectIsInstance(hit.hitObject) then
+            if types.Actor.isDead(hit.hitObject) then
+                -- Treat as a miss: just move the projectile forward
+                core.sendGlobalEvent('MagExp_ProjectileMove', {
+                    projectile  = self,
+                    newPos      = to,
+                    newRot      = currentRotation,
+                    soundAnchor = soundAnchor,
+                    lightAnchor = lightAnchor
+                })
+                return
+            end
+        end
+
         hasCollided = true
         stopSound()
         core.sendGlobalEvent('MagExp_ProjectileCollision', {
@@ -144,6 +197,7 @@ local function onUpdate(dt)
             attacker    = attacker,
             spellId     = spellId,
             area        = area,
+            effectIndexes = effectIndexes,
             soundAnchor = soundAnchor,
             lightAnchor = lightAnchor
         })
@@ -162,6 +216,7 @@ end
 return {
     engineHandlers = {
         onUpdate = onUpdate,
+        onObjectCollision = onObjectCollision,
     },
     eventHandlers = {
         MagExp_InitProjectile  = onInit,
