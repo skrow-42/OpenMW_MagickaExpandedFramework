@@ -1,4 +1,4 @@
-```markdown
+
 # SPELL FRAMEWORK PLUS (MagExp) v1.8
 
 **SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It dehardcodes the magic system and provides a unified public interface (`I.MagExp`) for modders to trigger spell casts, control projectiles in flight, and hook into lifecycle events.
