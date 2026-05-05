@@ -38,6 +38,8 @@ local casterLinked    = false
 local userData        = nil
 local muteAudio       = false
 local muteLight       = false
+local continuousVfx   = false
+local effectScale     = nil
 
 -- ---- Physics extensions ----
 -- accelerationExp: exponential signed speed multiplier per frame.
@@ -132,6 +134,8 @@ local function onInit(data)
         userData      = data.userData      or nil
         muteAudio     = data.muteAudio     or false
         muteLight     = data.muteLight     or false
+        continuousVfx = data.continuousVfx or false
+        effectScale   = data.effectScale
 
         if spinSpeed > 0 then isRotating = true end
 
@@ -360,7 +364,9 @@ local function onUpdate(dt)
             casterLinked  = casterLinked,
             userData      = userData,
             muteAudio     = muteAudio,
-            muteLight     = muteLight
+            muteLight     = muteLight,
+            continuousVfx = continuousVfx,
+            effectScale   = effectScale
         })
         return
     end

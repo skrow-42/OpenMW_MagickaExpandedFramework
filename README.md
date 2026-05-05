@@ -1,4 +1,5 @@
-# SPELL FRAMEWORK PLUS (MagExp) v1.7a
+```markdown
+# SPELL FRAMEWORK PLUS (MagExp) v1.8
 
 **SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It dehardcodes the magic system and provides a unified public interface (`I.MagExp`) for modders to trigger spell casts, control projectiles in flight, and hook into lifecycle events.
 
@@ -67,6 +68,7 @@ Note: In the code, these indices are 0-based (matching the OpenMW engine's inter
 | `cancelSpell(projId)` | Force-cancel and remove a live spell. |
 | `setSpellBounce(projId, enabled, max, power)` | Configure bounce on a live spell. |
 | `setSpellDetonateOnActor(projId, bool)` | Toggle whether actor contact detonates a bouncing spell. |
+| `setSpellPiercing(projId, enabled, newLimit)` | Toggle piercing and/or change the pierce cap on a live spell. |
 | `getActiveSpellIds()` | Returns a table of all live spell projectile IDs. |
 
 ### Lifecycle Hooks
@@ -77,7 +79,13 @@ I.MagExp.onEffectApplied    = function(actor, effect) end
 I.MagExp.onEffectTick       = function(actor, effect) end
 I.MagExp.onEffectOver       = function(actor, effect) end
 I.MagExp.onProjectileBounce = function(data) end
--- data: { projectile, spellId, attacker, hitPos, hitNormal, bounceCount, speed }
+-- data: { projectile, spellId, attacker, hitPos, hitNormal, bounceCount, speed, actor, actorId }
+-- actor: the hit Actor object if the surface was an actor, nil if world geometry.
+-- actorId: shorthand for actor.id, or nil.
+I.MagExp.onProjectilePierce = function(data) end
+-- data: { projectile, spellId, attacker, hitPos, hitNormal, velocity, actor, actorId, pierceCount, pierceLimit, userData }
+-- Fires each time a piercing projectile passes through an actor.
+-- actor is always a valid Actor here (non-actors never trigger the pierce path).
 ```
 
 ---
@@ -98,6 +106,29 @@ core.sendGlobalEvent('MagExp_CastRequest', {
     isFree    = true
 })
 ```
+
+### Player Quick Cast Event: `MagExp_StartQuickCast`
+
+For player-side casting with integrated animation control and optional charge behavior, use:
+
+```lua
+local self = require('openmw.self')
+
+self:sendEvent('MagExp_StartQuickCast', {
+    spellId   = "fireball",
+    item      = nil,           -- optional: item source for enchantments
+    isFree    = false,         -- optional: skip magicka check
+    chargeKey = "MyMod_CastKey"  -- optional: key ID for charge-as-cast behavior
+})
+```
+
+**Charge-as-Cast Behavior:**
+- If `chargeKey` is omitted or `nil` → standard instant cast (tap to fire).
+- If `chargeKey` is provided AND the player is **still holding the registered key** when the animation reaches the `start` text key → the animation enters a **charge loop**.
+- The spell fires at the `release` text key **after** the player releases the key.
+- If the key is released **before** the `start` text key → instant cast (no charge loop).
+
+This enables a single input key to act as both the cast trigger and the charge hold key, creating a seamless tap-to-cast / hold-to-charge mechanic.
 
 ---
 
@@ -132,6 +163,10 @@ All fields except the first four are optional.
 | **bouncePower** | `number` | `0.7` | Restitution coefficient (0-1). |
 | **detonateOnActorHit** | `boolean` | `true` | If false, actors are treated as static for bounce. |
 | **impactImpulse** | `number` | `0` | MaxYari LuaPhysics knockback magnitude. |
+| |
+| **Piercing** |
+| **piercing** | `boolean` | `false` | If `true`, the projectile passes through actors on contact, applying spell effects to each pierced actor, instead of stopping. Geometry collisions still cause normal detonation. |
+| **pierceLimit** | `int` / `nil` | `nil` | Maximum number of actors the projectile can pierce before it force-detonates. `nil` = unlimited (flies through all actors until lifetime or geometry). |
 | |
 | **Audiovisual** |
 | **vfxRecId** | `string` | Auto | Bolt VFX record ID (auto-detected). |
@@ -209,6 +244,10 @@ These fields can be passed as a table to mutate a live projectile.
 | `maxLifetime` | `number` | Override max lifetime. |
 | `impactImpulse` | `number` | Override physics knockback. |
 | |
+| **Piercing** |
+| `piercing` | `boolean` | Enable/disable piercing mode mid-flight. |
+| `pierceLimit` | `int` / `nil` | New pierce cap. `nil` = unlimited. |
+| |
 | **Identity & Visuals** |
 | `spellId` | `string` | Override what is applied on impact. |
 | `area` | `number` | Override area radius. |
@@ -270,8 +309,82 @@ I.MagExp.launchSpell({
 -- Listen for bounces
 I.MagExp.onProjectileBounce = function(data)
     print("Bounce #" .. data.bounceCount .. " at " .. tostring(data.hitPos))
+    if data.actor then
+        print("  Bounced off actor: " .. data.actor.recordId)
+    else
+        print("  Bounced off world geometry")
+    end
 end
 ```
+
+---
+
+## 7b. Piercing Physics
+
+When `piercing = true`, a projectile **passes through actors** instead of detonating on contact. On each pass-through, the spell effects are applied to the pierced actor, all hit events fire, and the projectile continues flying with its original velocity. The projectile still detonates normally on world geometry (walls, terrain).
+
+**Rules:**
+- **Actors**: Spell effects are applied on contact, but the projectile does **not** stop. The same actor cannot be pierced more than once per projectile (tracked internally per-projectile).
+- **Geometry**: Normal detonation (identical to non-piercing spells).
+- **`pierceLimit`**: If set to an integer, the projectile force-detonates after piercing that many actors. If `nil`, the projectile flies through unlimited actors until lifetime expires or geometry is hit.
+- Each pierce fires the `MagExp_OnProjectilePierce` global event and the `I.MagExp.onProjectilePierce` hook.
+
+```lua
+-- Chain lightning that passes through up to 3 enemies
+I.MagExp.launchSpell({
+    attacker    = actor,
+    spellId     = "chain_lightning",
+    startPos    = spawnPos, direction = dir,
+    piercing    = true,
+    pierceLimit = 3,   -- passes through 3 actors, detonates on the 4th or at end of life
+})
+
+-- Listen for pierces
+I.MagExp.onProjectilePierce = function(data)
+    print("Pierced actor: " .. data.actor.recordId
+       .. " (" .. data.pierceCount .. "/" .. tostring(data.pierceLimit or "∞") .. ")")
+end
+```
+
+### `onProjectilePierce` Data Fields
+
+| Field | Type | Description |
+|:--- |:--- |:--- |
+| `projectile` | `Object` | The projectile object. |
+| `spellId` | `string` | Spell record ID. |
+| `attacker` | `Actor` | The casting actor. |
+| `actor` | `Actor` | The actor being pierced. **Never nil** in this hook. |
+| `actorId` | `string` | Shorthand for `actor.id`. |
+| `hitPos` | `Vector3` | World position of the pierce contact. |
+| `hitNormal` | `Vector3` | Surface normal at contact. |
+| `velocity` | `Vector3` | Projectile velocity at time of pierce. |
+| `pierceCount` | `number` | How many actors have been pierced so far (including this one). |
+| `pierceLimit` | `int` / `nil` | The pierce cap, or `nil` if unlimited. |
+| `isPierce` | `boolean` | Always `true` in this hook. |
+| `userData` | `table` | Custom launch cookie. |
+
+### `setSpellPiercing` — In-Flight Pierce Control
+
+Toggles or reconfigures piercing on a live spell projectile.
+
+```lua
+I.MagExp.setSpellPiercing(projId, enabled, newLimit)
+```
+
+| Parameter | Type | Description |
+|:--- |:--- |:--- |
+| `projId` | `string` | The projectile object ID from `launchSpell` return value. |
+| `enabled` | `boolean` | `true` to enable piercing, `false` to disable. |
+| `newLimit` | `int` / `nil` | New pierce cap. `nil` = unlimited. |
+
+```lua
+-- Make a spell pierce up to 5 actors mid-flight
+local proj = I.MagExp.launchSpell({ ... })
+I.MagExp.setSpellPiercing(proj.id, true, 5)
+```
+
+> [!NOTE]
+> Piercing and bouncing are independent systems. A spell can have both `piercing = true` and `bounceEnabled = true` — it will pass through actors (applying effects) and bounce off geometry. If `detonateOnActorHit = false` is also set on a bouncing spell, piercing takes priority for actor contacts.
 
 ---
 
@@ -384,7 +497,8 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 |:--- |:--- |:--- |
 | **Primary Entities** |
 | `attacker` | `GameObject` | The casting actor. |
-| `target` | `GameObject` | The hit object. |
+| `target` | `GameObject` | The hit object (may be actor, door, static, etc.). |
+| `actor` | `Actor` / `nil` | The hit object resolved as an Actor if it is an NPC, Creature, or Player. `nil` if the target is world geometry or any non-actor object. Available in all event data tables. |
 | |
 | **Spatial & Physics** |
 | `hitPos` | `Vector3` | Impact world position. |
@@ -413,6 +527,11 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 | `stackLimit` | `number` | Stacking limit for this spell. |
 | `stackCount` | `number` | Current instances after this hit. |
 | `proxyLookup` | `boolean` | True if resolved via iterative search. |
+| |
+| **Pierce Context (present only on pierce-through hits)** |
+| `isPierce` | `boolean` | `true` if this hit was from a piercing pass-through (not a final detonation). |
+| `pierceCount` | `number` | How many actors have been pierced so far (including this one). |
+| `pierceLimit` | `int` / `nil` | The pierce cap, or `nil` if unlimited. |
 
 ### Robust Record Identification
 The framework uses a two-phase lookup system for `spellId`. If the engine cannot find a record by direct key (common when using numeric proxies in OSSC or Trap mods), SFP performs an iterative case-insensitive search to locate the correct spell or enchantment data. This ensures Area and Damage metadata is never lost.
@@ -560,6 +679,85 @@ I.MagExp.launchSpell({
 })
 ```
 
+### G. Piercing Spell (Pass Through Enemies)
+
+```lua
+-- A lightning lance that pierces through up to 3 enemies, applying shock damage to each
+I.MagExp.launchSpell({
+    attacker    = actor,
+    spellId     = "lightning_lance",
+    startPos    = actor.position + util.vector3(0, 0, 100),
+    direction   = actor.rotation * util.vector3(0, 1, 0),
+    piercing    = true,
+    pierceLimit = 3,   -- passes through 3 actors, detonates on 4th hit or geometry/lifetime
+    isFree      = true,
+})
+
+-- Listen for each pierce event
+I.MagExp.onProjectilePierce = function(data)
+    print(string.format("Pierced %s (%d/%s)",
+        data.actor.recordId,
+        data.pierceCount,
+        tostring(data.pierceLimit or "∞")))
+end
+```
+
+### H. Unlimited Piercing Beam
+
+```lua
+-- A beam that passes through ALL actors it encounters until it hits a wall or expires
+I.MagExp.launchSpell({
+    attacker    = actor,
+    spellId     = "death_ray",
+    startPos    = pos,
+    direction   = dir,
+    piercing    = true,
+    pierceLimit = nil,   -- unlimited: only geometry or lifetime stops it
+    speed       = 6000,
+    maxLifetime = 3,
+    isFree      = true,
+})
+```
+
+### I. Mid-Flight Pierce Toggle
+
+```lua
+-- Launch a normal bolt, then make it piercing after a delay
+local proj = I.MagExp.launchSpell({
+    attacker = actor, spellId = "shock_bolt",
+    startPos = pos, direction = dir,
+})
+
+-- After some condition is met, enable piercing mid-flight
+I.MagExp.setSpellPiercing(proj.id, true, 2)  -- pierce up to 2 actors from now on
+```
+
+### J. Tap-to-Cast / Hold-to-Charge (Single Key)
+
+```lua
+-- In your player script's onInit or when setting up keybinds:
+local I     = require('openmw.interfaces')
+local input = require('openmw.input')
+local self  = require('openmw.self')
+
+-- 1. Register the key once
+I.MagExp.registerChargeKey("MyMod_CastKey", function()
+    return input.isActionPressed(input.ACTION.Use)  -- or any key/action
+end)
+
+-- 2. Trigger cast (tap) or charge (hold) with the same key press
+local function onCastKeyPressed()
+    self:sendEvent('MagExp_StartQuickCast', {
+        spellId   = "fireball",
+        chargeKey = "MyMod_CastKey",  -- enables charge-as-cast behavior
+    })
+end
+
+-- Usage:
+-- TAP the key   → animation plays → 'start' fires → key already up → instant cast
+-- HOLD the key  → animation plays → 'start' fires → key still down → charge loop → release key → spell fires
+```
+
 ---
 
 ## 15. Utility Events
@@ -580,6 +778,9 @@ Launch a spell from a player/local script (see §3).
 - **Collision**: 5-point cross raycast pattern every frame, simulating a ~12-unit-radius sphere.
 - **Sound/Light Anchors**: Separate carrier objects parented to the projectile via teleport each frame.
 - **Bounding Box Awareness**: Distance checks for AoE registration use the target's physical center (bounding box center via `.halfSize`) rather than their origin (feet). This accounts for an object's physical radius, providing 1:1 hit-parity with vanilla's volume-based detection.
+- **Actor Resolution**: All event/callback data tables include a resolved `actor` field (the hit object as an Actor, or `nil` if it was not an actor). This is populated by the internal `resolveActorFromObject()` helper and applies uniformly to `MagExp_OnMagicHit`, `onProjectileBounce`, `onProjectilePierce`, and `MagExp_ProjectileCollision`.
+- **Pierce Immunity**: When a piercing projectile passes through an actor, that actor's ID is recorded in a per-projectile set. The same actor cannot be pierced twice by the same projectile, preventing repeated hits from the projectile lingering inside a collision volume.
+- **Charge-as-Cast Animation**: The player script polls the registered `chargeKey` at the `start` animation text key. If held, the animation enters a loop; if released before `start`, normal instant cast proceeds. This creates a seamless tap/hold mechanic with zero behavior change for tapped casts.
 
 ---
 
@@ -593,7 +794,7 @@ SFP synchronizes exactly with the engine's internal magic constants and global s
 
 ---
 
-## 17. Static Object Interactions
+## 18. Static Object Interactions
 
 Here are three APIs for configurable interactions with non-actors:
 
@@ -634,6 +835,9 @@ I.MagExp.emitProjectileFromObject({
     bounceEnabled    = true,
     bounceMax         = 3,
     bouncePower      = 0.7,
+    -- Optional Piercing Config
+    piercing         = true,      -- Pass through actors
+    pierceLimit      = 2,         -- Max 2 actors pierced
     -- Optional Audiovisual Overrides
     vfxRecId         = "my_bolt_vfx_record",
     areaVfxRecId     = "my_area_vfx_record",
@@ -800,37 +1004,49 @@ Both instant and charged spells **launch at the `release` text key**. The differ
 
 When `isCharged = true`, the animation loops on the `charge` text key until the registered key binding is released. The spell then proceeds automatically to `release` (firing the launch) and then `stop`.
 
+### Cast Key as Charge Key (Seamless Tap/Hold)
+
+The framework includes a **charge-as-cast** system: a single key press can act as both the cast trigger **and** the charge hold, creating a seamless tap-to-cast / hold-to-charge mechanic with **zero behavior change for instant casts**.
+
+**How it works:**
+1. The player presses a key (e.g., a custom "cast" hotkey or action button).
+2. Your mod fires `MagExp_StartQuickCast` with a `chargeKey` field referencing a registered key.
+3. The casting animation (`spellcast`) begins playing normally.
+4. When the animation reaches the `start` text key (end of wind-up phase):
+   - **If the key is still held** → the animation enters a charge loop (looping at the loop start/stop markers in the NIF/KF).
+   - **If the key has already been released** → the animation continues naturally to `release` → instant cast.
+5. While in the charge loop, the framework polls the key state every frame.
+6. When the player **releases the key** → the animation resumes playing (loop = false) → proceeds to `release` → spell fires → `stop` clears state.
+
+**Result:** Tapping the key = instant cast. Holding the key = charge loop → release key = spell fires. All with a single unified input.
+
 ### Registering a Charge Key (from any player/local script)
 
 ```lua
 local I     = require('openmw.interfaces')
 local input = require('openmw.input')
 
--- Register once, typically in onInit or on first cast:
-I.MagExp.registerChargeKey("MyMod_HoldKey", function()
-    return input.isKeyPressed(input.KEY.X)  -- or any key/action
+-- Register once, typically in onInit or when setting up keybinds:
+I.MagExp.registerChargeKey("MyMod_CastKey", function()
+    return input.isActionPressed(input.ACTION.Use)  -- or any key/action
 end)
 ```
 
-### Launching a Charged Spell
+### Triggering a Charge-as-Cast Spell
 
 ```lua
--- In your global script:
-I.MagExp.launchSpellAnim({
-    actor     = player,
-    animGroup = "spellcharge",
-    blendMask = I.MagExp.BLEND_MASK.UpperBody,
-    priority  = I.MagExp.PRIORITY.Scripted,
-    isCharged = true,
-    chargeKey = "MyMod_HoldKey",  -- must match the registered ID
+-- In your player script (when the cast key is pressed):
+local self = require('openmw.self')
+
+self:sendEvent('MagExp_StartQuickCast', {
+    spellId   = "fireball",
+    chargeKey = "MyMod_CastKey",  -- enables charge-as-cast behavior
 })
 ```
 
-MagExp's player script polls this key every frame. When it detects the key released, it automatically:
-1. Breaks out of the charge loop.
-2. Lets the animation proceed to the `release` text key.
-3. The existing `onTextKey` handler fires `MagExp_CastRequest` at the `release` key.
-4. The animation finishes at `stop` and cast state is cleared.
+**Behavior:**
+- **Tap** the key → animation plays → `start` fires → key already up → goes straight to `release` → instant cast (0.94s total).
+- **Hold** the key → animation plays → `start` fires → key still down → enters charge loop → release key → `release` fires → spell launches.
 
 ### Cross-Mod Key Binding API
 
@@ -845,6 +1061,13 @@ MagExp's player script polls this key every frame. When it detects the key relea
 > [!NOTE]
 > Each mod should use a unique `keyId` string to avoid collision with other mods' bindings. Convention: `"ModName_PurposeKey"` (e.g. `"OSSC_ChargeKey"`).
 
+### Backward Compatibility
+
+- If you call `MagExp_StartQuickCast` **without** the `chargeKey` field (or pass `nil`), the system behaves exactly as before: instant cast only, no charge loop.
+- Existing mods using the framework are unaffected.
+- The `launchSpellAnim` API (§22) still supports explicit `isCharged = true` mode for custom animation groups with standalone charge loops independent of the cast trigger.
+
+---
 
 ### Credits
 Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place (and also for the docs)
@@ -854,3 +1077,4 @@ Credits to MaxYari for his Lua Physics engine
 Credits to hyacinth and ownlyme for SharedRay lib
 
 Credits to all of the users supporting me in the OpenMW Discord
+```

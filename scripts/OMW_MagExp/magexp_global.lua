@@ -26,6 +26,9 @@ local customFilters          = {}
 local trackedEffectRegistry  = {}
 local cachedDynamicRecords   = {} -- [hash_key] = record_string_id
 
+-- [FEATURE] continuousVFX Actor Registry - Track actors with continuous VFX
+local continuousVfxActors    = {} -- [actorId] = {actor, spellId, vfxTag, registrationTime}
+
 -- [FEATURE 6] Cross-mod charge key registry: [keyId] = isPressed function
 -- Populated by player scripts via I.MagExp.registerChargeKey()
 local chargeKeyRegistry = {}
@@ -57,6 +60,134 @@ end
 
 local function debugLog(msg)
     print("[MagExp] " .. tostring(msg))
+end
+
+local function playerNotifyCastIssue(actor, msg)
+    if not msg or type(msg) ~= "string" then return end
+    if not actor or not actor:isValid() or actor.type ~= types.Player then return end
+    pcall(function() actor:sendEvent('Ui_ShowMessage', msg) end)
+end
+
+--- Read current enchant charge (types.Item.enchantmentCharge is not available in all API versions).
+local function magExpReadItemEnchantmentCharge(item)
+    local ch, ok = 0, false
+    if not item or not item:isValid() then return 0, false end
+    pcall(function()
+        local itemData = types.Item.itemData(item)
+        if itemData and itemData.enchantmentCharge ~= nil then
+            ch = itemData.enchantmentCharge
+            ok = true
+        end
+    end)
+    return ch, ok
+end
+
+--- Scroll stacks and enchantment charge must be mutated from a **global** script
+--- (see OpenMW docs: GameObject:remove / item charge writes are not allowed from local player scripts).
+--- Prefer `data.item` (the equipped / selected GameObject) so the correct stack or instance is used.
+local function magExpApplyInventoryResourceConsumption(attacker, data)
+    if not data or not attacker or not attacker:isValid() then return end
+    local inv = types.Actor.inventory(attacker)
+
+    local function resolveItem()
+        if data.item and type(data.item) ~= "string" and data.item:isValid() then
+            return data.item
+        end
+        if data.itemRecordId and inv then
+            return inv:find(data.itemRecordId)
+        end
+        return nil
+    end
+
+    if data.itemCountCost and data.itemCountCost > 0 then
+        local item = resolveItem()
+        if item and item:isValid() then
+            pcall(function() item:remove(data.itemCountCost) end)
+        end
+    end
+    if data.itemChargeCost and data.itemChargeCost > 0 then
+        local item = resolveItem()
+        if item and item:isValid() then
+            pcall(function()
+                local itemData = types.Item.itemData(item)
+                if itemData then
+                    local old = itemData.enchantmentCharge
+                    if old == nil then old = 0 end
+                    itemData.enchantmentCharge = math.max(0, old - data.itemChargeCost)
+                end
+            end)
+        end
+    end
+end
+
+--- Quick-cast / global-event payload may be a number or a serialized string key.
+local function coerceEffectScale(v)
+    if v == nil then return 1.0 end
+    if type(v) == "number" and v == v then
+        if v < 0 then return 0 end
+        if v > 1 then return 1 end
+        return v
+    end
+    if type(v) == "string" then
+        local s = tostring(v):lower():gsub('^%s+', ''):gsub('%s+$', '')
+        if s == "reduce_25" or s == "reduce 25%" or s == "ossc_penalty_25" then return 0.75 end
+        if s == "reduce_50" or s == "reduce 50%" or s == "ossc_penalty_50" then return 0.50 end
+        if s == "off" or s == "disabled" or s == "ossc_penalty_off" or s == "" then return 1.0 end
+        local n = tonumber(s)
+        if n then return math.max(0, math.min(1, n)) end
+    end
+    local tn = tonumber(v)
+    if tn then return math.max(0, math.min(1, tn)) end
+    return 1.0
+end
+
+--- OpenMW uses MagicEffectWithParams (.effect) but some tables still expose .id; modify()/getEffect() want the engine id string (often lowercase, no spaces).
+local function magicEffectIdCandidates(rawEff)
+    local seen = {}
+    local out = {}
+    local function add(x)
+        if x == nil then return end
+        local s = tostring(x):lower()
+        if s == "" then return end
+        if not seen[s] then seen[s] = true; table.insert(out, s) end
+        local c = s:gsub('%s+', ''):gsub('_', '')
+        if c ~= s and c ~= "" and not seen[c] then seen[c] = true; table.insert(out, c) end
+    end
+    if rawEff then
+        add(rawEff.id)
+        pcall(function()
+            if rawEff.effect and rawEff.effect.id then add(rawEff.effect.id) end
+        end)
+        local probe = rawEff.id
+        if (not probe or probe == "") and rawEff.effect then
+            pcall(function() probe = rawEff.effect.id end)
+        end
+        if probe then
+            local rec = core.magic.effects.records[probe]
+            if rec and rec.id then add(rec.id) end
+        end
+    end
+    return out
+end
+
+local function magicEffectExtraParam(rawEff)
+    if not rawEff then return nil end
+    if type(rawEff.affectedAttribute) == "string" and rawEff.affectedAttribute ~= "" then
+        return rawEff.affectedAttribute
+    end
+    if type(rawEff.affectedSkill) == "string" and rawEff.affectedSkill ~= "" then
+        return rawEff.affectedSkill
+    end
+    return nil
+end
+
+local function pickEffectIdForModify(activeEffects, candidates, extra)
+    if not activeEffects or not candidates or #candidates == 0 then return nil end
+    for _, cid in ipairs(candidates) do
+        local ok, eff = pcall(function() return activeEffects:getEffect(cid, extra) end)
+        if ok and eff then return cid end
+    end
+    return candidates[1]
 end
 
 -- ============================================================
@@ -142,6 +273,46 @@ local function getSpellDamageInfo(spellId)
     return dt
 end
 
+--- True when the spell effect's recorded range is "on self".
+local function spellEffectRangeIsSelf(r)
+    local R = core.magic.RANGE
+    if r == nil then return false end
+    if R and r == R.Self then return true end
+    if type(r) == "string" then
+        local s = r:lower():gsub("^%s+", ""):gsub("%s+$", "")
+        return s == "self" or s == "on self"
+    end
+    if type(r) == "number" and R and type(R.Self) == "number" then
+        return r == R.Self
+    end
+    return false
+end
+
+--- Pick which spell.effects entry represents this hit (effects[1] fails when Self is listed first).
+local function inferEffectIndexForMagicHit(spell, data)
+    local R = core.magic.RANGE
+    local st = data.spellType or R.Target
+    if not spell or not spell.effects then return 0 end
+    if st == R.Self then
+        for i, eff in ipairs(spell.effects) do
+            if spellEffectRangeIsSelf(eff.range) then return i - 1 end
+        end
+        return 0
+    elseif st == R.Touch then
+        for i, eff in ipairs(spell.effects) do
+            if eff.range == R.Touch then return i - 1 end
+        end
+    elseif st == R.Target then
+        for i, eff in ipairs(spell.effects) do
+            if not spellEffectRangeIsSelf(eff.range) and eff.range ~= R.Touch then return i - 1 end
+        end
+        for i, eff in ipairs(spell.effects) do
+            if eff.range == R.Touch then return i - 1 end
+        end
+    end
+    return 0
+end
+
 local function fireMagicHitEvent(data)
     -- data expects: attacker, target, spellId, hitPos, hitNormal, spellType, isAoE, area, velocity, projectile, userData
     local spellId = data.spellId
@@ -169,6 +340,15 @@ local function fireMagicHitEvent(data)
 
     if not spell then return end
 
+    local metaIdx = data.effectIndex
+    if metaIdx == nil then
+        metaIdx = inferEffectIndexForMagicHit(spell, data)
+    end
+    local firstEff = spell.effects and spell.effects[(metaIdx or 0) + 1]
+    if not firstEff and spell.effects and spell.effects[1] then
+        firstEff = spell.effects[1]
+    end
+
     local info = {
         attacker     = data.attacker,
         target       = data.target,
@@ -190,11 +370,10 @@ local function fireMagicHitEvent(data)
         userData     = data.userData
     }
 
-    -- Metadata detection (Strict Primary-Only to match vanilla engine)
-    local firstEff = spell.effects and spell.effects[1]
+    -- Metadata detection: effect driving this hit (not always spell.effects[1] when Self precedes Touch/Target).
     info.magMin = 0
     info.magMax = 0
-    
+
     if firstEff then
         local mgef = core.magic.effects.records[firstEff.id]
         if mgef then
@@ -248,9 +427,9 @@ local function fireMagicHitEvent(data)
         data.target:sendEvent('MagExp_Local_MagicHit', info)
 
         -- Manual dispatch for specific school hit effects (Actors only)
-        if types.Actor.objectIsInstance(data.target) and data.target.enabled and spell.effects and spell.effects[1] then
+        if not data.muteAudio and types.Actor.objectIsInstance(data.target) and data.target.enabled and firstEff then
             pcall(function()
-                local mgef = core.magic.effects.records[spell.effects[1].id]
+                local mgef = core.magic.effects.records[firstEff.id]
                 if mgef then
                     -- Hit Sound
                     local snd = mgef.school:lower() .. " hit"
@@ -285,7 +464,46 @@ end
 -- ============================================================
 -- [CORE] Authoritative Spell Application
 -- ============================================================
-local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)
+
+--- Fallback hit static record id when mgef.hitVfx is absent (ported from legacy manual apply VFX resolver).
+local function deriveMagicEffectImpactStaticId(mgef)
+    if not mgef then return nil end
+    if mgef.hitVfx and mgef.hitVfx ~= "" then return mgef.hitVfx end
+    local schoolIdx = mgef.school
+    local s = "destruction"
+    if type(schoolIdx) == "string" then s = schoolIdx:lower()
+    elseif type(schoolIdx) == "number" then
+        local schools = { [0] = "alteration", [1] = "conjuration", [2] = "destruction", [3] = "illusion", [4] = "mysticism", [5] = "restoration" }
+        s = schools[schoolIdx] or "destruction"
+    end
+
+    local n = (mgef.name or ""):lower()
+    local eid = tostring(mgef.id):lower()
+    local element = nil
+    if n:find("fire") or eid:find("fire") then element = "Fire"
+    elseif n:find("frost") or eid:find("frost") or n:find("cold") or eid:find("cold") then element = "Frost"
+    elseif n:find("shock") or eid:find("shock") or n:find("lightn") then element = "Lightning"
+    elseif n:find("poison") or eid:find("poison") then element = "Poison"
+    end
+
+    local hitVfxId
+    if element then hitVfxId = "VFX_" .. element .. "Hit"
+    elseif s == "destruction" then hitVfxId = "VFX_DestructHit"
+    elseif s == "alteration" then hitVfxId = "VFX_AlterationHit"
+    elseif s == "conjuration" then hitVfxId = "VFX_ConjureHit"
+    elseif s == "illusion" then hitVfxId = "VFX_IllusionHit"
+    elseif s == "mysticism" then hitVfxId = "VFX_MysticismHit"
+    elseif s == "restoration" then hitVfxId = "VFX_RestorationHit"
+    else hitVfxId = "VFX_DefaultHit" end
+
+    local lId = tostring(hitVfxId):lower()
+    if not (types.Static.records[lId] or types.Weapon.records[lId]) then
+        if tostring(hitVfxId):find("Hit") then hitVfxId = "VFX_DefaultHit" end
+    end
+    return hitVfxId
+end
+
+local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData)
     if not target or not target:isValid() then return end
     if not (caster and caster:isValid()) then caster = target end
     if target.type ~= types.NPC and target.type ~= types.Creature and target.type ~= types.Player then
@@ -307,7 +525,6 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         spell = core.magic.enchantments.records[spellId]
         isEnchantment = true
     end
-    -- Deep search fallback (proxy may be numerically indexed)
     if not spell then
         isEnchantment = false
         for _, rec in pairs(core.magic.spells.records) do
@@ -325,7 +542,6 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             end
         end
     end
-    -- Effect-level fallback: synthesize minimal spell wrapper
     if not spell then
         local effRec = core.magic.effects.records[spellId]
         if not effRec then
@@ -349,7 +565,6 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         return
     end
 
-    -- Check for harmful and casterLinked flags
     local hasHarmful = false
     local hasCasterLinked = casterLinked or false
     if spell.effects then
@@ -357,11 +572,11 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             print("MagExp: Checking effect " .. eff.id)
             local mgef = core.magic.effects.records[eff.id]
             if mgef then
-                if mgef.harmful then 
+                if mgef.harmful then
                     print("MagExp: Detected harmful effect: " .. eff.id)
                     hasHarmful = true
                 end
-                if mgef.casterLinked then 
+                if mgef.casterLinked then
                     print("MagExp: Detected casterLinked effect: " .. eff.id)
                     hasCasterLinked = true
                 end
@@ -373,87 +588,6 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         print("MagExp: No effects in spell")
     end
 
-    -- [SCHOOL VISUALS] Manual dispatch for schools that struggle with global application
-    if spell.effects and spell.effects[1] then
-        pcall(function()
-            local mgef = core.magic.effects.records[spell.effects[1].id]
-            if mgef then
-                local eId = mgef.id:lower()
-                local isPersistentEffect = STACK_CONFIG.PERSISTENT_EFFECTS[eId] == true
-                local isPersistentLoop = isPersistentEffect and (spell.effects[1].duration or 0) > 0
-                local vfxId = mgef.hitStatic
-                
-                if vfxId and vfxId ~= "" then
-                    local static = types.Static.records[vfxId]
-                    if static and static.model then
-                        -- [CLEANUP REGISTRATION]
-                        if isPersistentLoop then
-                            if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
-                            activeVfxRegistry[target.id][spellId] = target
-                        end
-
-                        local vfxOptions = { mwMagicVfx = true } -- Engine-managed one-shot
-                        if isPersistentLoop then
-                            vfxOptions = { 
-                                loop      = true, 
-                                mwMagicVfx = false, 
-                                vfxId     = "MagExp_" .. spellId 
-                            }
-                        end
-
-                        if target.enabled then
-                            target:sendEvent('AddVfx', {
-                                model = static.model,
-                                options = vfxOptions
-                            })
-                        end
-
-                        -- [TIMER CLEANUP] AUTHORITATIVE REMOVAL
-                        if isPersistentLoop then
-                            local duration = spell.effects[1].duration or 30
-                            async:newUnsavableSimulationTimer(duration, function()
-                                if target and target:isValid() then
-                                    target:sendEvent('RemoveVfx', "MagExp_" .. spellId)
-                                end
-                            end)
-                        end
-                    end
-                end
-                
-                -- Play school sound
-                if not muteAudio and target.enabled then
-                    local snd = mgef.school:lower() .. " hit"
-                    target:sendEvent('PlaySound3d', { sound = snd })
-                end
-            end
-        end)
-    end
-
-    debugLog(string.format("Applying %s to %s", spellId, target.recordId or target.id))
-
-    -- BROADCAST HIT EVENT (For Self/Touch spells that don't go through projectile logic)
-    -- If isAoe is true, it means it's being applied via detonateSpellAtPos
-    if not isAoe and spell and spell.effects and spell.effects[1] then
-        local r = spell.effects[1].range
-        if r == core.magic.RANGE.Self or r == core.magic.RANGE.Touch then
-            fireMagicHitEvent({
-                attacker  = caster,
-                target    = target,
-                spellId   = spellId,
-                hitPos    = hitPos or target.position,
-                spellType = r,
-                isAoE     = false,
-                area      = spell.effects[1].area or 0,
-                unreflectable = unreflectable or false,
-                userData  = userData,
-                muteAudio = muteAudio,
-                muteLight = muteLight
-            })
-        end
-    end
-
-    -- [FIX] Treat an empty table the same as nil so activeSpells:add always
-    -- receives a populated list (or none at all, letting the engine use defaults).
     local effectIndexes = (forcedEffects and #forcedEffects > 0) and forcedEffects or nil
     if not effectIndexes and spell.effects then
         effectIndexes = {}
@@ -462,31 +596,223 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         end
     end
 
+    local sameCasterAsTarget = (caster and caster:isValid() and target and target:isValid() and caster.id == target.id)
+    if effectIndexes and spell.effects and not sameCasterAsTarget then
+        local filtered = {}
+        for _, idx in ipairs(effectIndexes) do
+            local eff = spell.effects[idx + 1]
+            if eff and not spellEffectRangeIsSelf(eff.range) then
+                table.insert(filtered, idx)
+            end
+        end
+        effectIndexes = (#filtered > 0) and filtered or nil
+    end
+
+    if not effectIndexes or #effectIndexes == 0 then
+        debugLog("applySpellToActor: no eligible effects on this actor (after range gate) — " .. tostring(spellId))
+        return
+    end
+
+    local primaryApplied = spell.effects and spell.effects[effectIndexes[1] + 1]
+
+    -- [HIT VISUALS]
+    pcall(function()
+        local audioPlayedThisApply = false
+        local function resolveSpawnPos()
+            local vfxPos = hitPos
+            if not vfxPos or isAoe then
+                local tStr = tostring(target.type)
+                if tStr:find("NPC") or tStr:find("Creature") or tStr:find("Player") then
+                    local zOffset = heightCache[target.id]
+                    if not zOffset then
+                        zOffset = 45
+                        pcall(function()
+                            local bbox = target:getBoundingBox()
+                            if bbox then
+                                zOffset = bbox.halfSize.z * 1.1
+                                if zOffset > 105 then zOffset = 65 end
+                            end
+                        end)
+                        heightCache[target.id] = zOffset
+                    end
+                    vfxPos = target.position + util.vector3(0, 0, zOffset)
+                else
+                    vfxPos = target.position
+                end
+            end
+            return vfxPos
+        end
+
+        for _, idx in ipairs(effectIndexes) do
+            local rawEff = spell.effects[idx + 1]
+            local mgef = rawEff and core.magic.effects.records[rawEff.id]
+            if rawEff and mgef then
+                local eId = mgef.id:lower()
+                local isPersistentEffect = STACK_CONFIG.PERSISTENT_EFFECTS[eId] == true
+                local isPersistentLoop = isPersistentEffect and (rawEff.duration or 0) > 0
+                local vfxTag = "MagExp_" .. tostring(spellId) .. "_" .. tostring(idx)
+
+                local staticId = mgef.hitStatic
+                local hasAttachStatic = staticId and staticId ~= ""
+                local static = hasAttachStatic and types.Static.records[staticId] or nil
+                if static and static.model and target.enabled then
+if isPersistentLoop then
+    if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
+    activeVfxRegistry[target.id][vfxTag] = { target = target, spellId = spellId }
+
+    -- [OPTION A FIX] Attach the VFX handler script to non-player actors
+    if target.type ~= types.Player then
+        debugLog(string.format("[Script Attach] Attempting to attach magexp_actor_vfx.lua to %s", target.recordId or "unknown"))
+        local ok, err = pcall(function()
+            target:addScript('scripts/OMW_MagExp/magexp_actor_vfx.lua')
+        end)
+        if ok then
+            debugLog("[Script Attach] Successfully attached (uppercase path)")
+        else
+            debugLog("[Script Attach] Uppercase path failed: " .. tostring(err))
+            ok, err = pcall(function()
+                target:addScript('scripts/omw_magexp/magexp_actor_vfx.lua')
+            end)
+            if ok then
+                debugLog("[Script Attach] Successfully attached (lowercase path)")
+            else
+                debugLog("[Script Attach] BOTH paths failed: " .. tostring(err))
+            end
+        end
+    end
+end
+
+                    local vfxOptions = { mwMagicVfx = true }
+                    if isPersistentLoop then
+                        vfxOptions = {
+                            loop       = true,
+                            mwMagicVfx = false,
+                            vfxId      = vfxTag,
+                        }
+                    end
+
+                    target:sendEvent('AddVfx', {
+                        model   = static.model,
+                        options = vfxOptions
+                    })
+
+                    if isPersistentLoop then
+                        local duration = rawEff.duration or 30
+                        async:newUnsavableSimulationTimer(duration, function()
+                            if target and target:isValid() then
+                                -- All actors now have RemoveVfx handler:
+                                -- player via its own local script,
+                                -- NPCs/Creatures via magexp_actor_vfx.lua attached above.
+                                debugLog(string.format("[Timed VFX Cleanup] Removing VFX '%s' from %s", vfxTag, target.recordId or "unknown"))
+                                pcall(function()
+                                    target:sendEvent('RemoveVfx', vfxTag)
+                                end)
+                            end
+                        end)
+                    end
+                end
+
+                if not isAoe and not (hasAttachStatic and static and static.model) then
+                    local hitVfxId = deriveMagicEffectImpactStaticId(mgef)
+                    if hitVfxId then
+                        local rid = tostring(hitVfxId):lower()
+                        local rec = types.Static.records[rid] or types.Weapon.records[rid]
+                        if rec and rec.model then
+                            local opts = { mwMagicVfx = false }
+                            if target:isValid() and target.enabled then
+                                opts.attachToObject = target
+                            end
+                            world.vfx.spawn(rec.model, resolveSpawnPos(), opts)
+                        end
+                    end
+                end
+
+                if not muteAudio and target.enabled and not audioPlayedThisApply then
+                    local schoolIdx = mgef.school
+                    local s = "destruction"
+                    if type(schoolIdx) == "string" then s = schoolIdx:lower()
+                    elseif type(schoolIdx) == "number" then
+                        local schools = { [0] = "alteration", [1] = "conjuration", [2] = "destruction", [3] = "illusion", [4] = "mysticism", [5] = "restoration" }
+                        s = schools[schoolIdx] or "destruction"
+                    end
+                    if mgef.hitSound and mgef.hitSound ~= "" then
+                        pcall(function() core.sound.playSound3d(mgef.hitSound, target, { volume = 1.0 }) end)
+                    elseif mgef.school then
+                        target:sendEvent('PlaySound3d', { sound = mgef.school:lower() .. " hit" })
+                    else
+                        pcall(function() core.sound.playSound3d(tostring(s):lower() .. " hit", target, { volume = 1.0 }) end)
+                    end
+                    audioPlayedThisApply = true
+                end
+            end
+        end
+    end)
+
+    debugLog(string.format("Applying %s to %s", spellId, target.recordId or target.id))
+
+    local Rrng = core.magic.RANGE
+    if not isAoe and primaryApplied then
+        local r = primaryApplied.range
+        if r == Rrng.Touch then
+            fireMagicHitEvent({
+                attacker      = caster,
+                target        = target,
+                spellId       = spellId,
+                hitPos        = hitPos or target.position,
+                spellType     = Rrng.Touch,
+                isAoE         = false,
+                area          = primaryApplied.area or 0,
+                effectIndex   = effectIndexes[1],
+                unreflectable = unreflectable or false,
+                userData      = userData,
+                muteAudio     = muteAudio,
+                muteLight     = muteLight
+            })
+        elseif r == Rrng.Self and sameCasterAsTarget then
+            fireMagicHitEvent({
+                attacker      = caster,
+                target        = target,
+                spellId       = spellId,
+                hitPos        = hitPos or target.position,
+                spellType     = Rrng.Self,
+                isAoE         = false,
+                area          = primaryApplied.area or 0,
+                effectIndex   = effectIndexes[1],
+                unreflectable = unreflectable or false,
+                userData      = userData,
+                muteAudio     = muteAudio,
+                muteLight     = muteLight
+            })
+        end
+    end
+
     local ok, err = pcall(function()
         local activeSpells = types.Actor.activeSpells(target)
         if activeSpells then
+            local effectiveSpellId = spellId
+            if isEnchantment and itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
+                effectiveSpellId = itemObject.recordId
+                debugLog(string.format("Using item ID %s for enchanted spell effects instead of enchantment ID %s", effectiveSpellId, spellId))
+            end
+
             local params = {
-                id      = spellId, -- Use the Enchantment/Spell ID so the engine plays persistent visuals (Shield, etc.)
+                id      = effectiveSpellId,
                 effects = effectIndexes,
             }
-            if caster and caster:isValid() then 
+            if caster and caster:isValid() then
                 if types.NPC.objectIsInstance(caster) or types.Creature.objectIsInstance(caster) or types.Player.objectIsInstance(caster) then
-                    params.caster = caster 
+                    params.caster = caster
                 end
             end
 
-            -- Apply effects
             if isEnchantment then
-                -- Provide the item source for mods that need it (like OSSC)
                 if type(itemObject) == "string" and caster and caster:isValid() then
-                    -- Resolve recordId string to a real item proxy if possible
                     pcall(function()
                         local inv = types.Actor.inventory(caster)
                         local found = inv:find(itemObject)
                         if found then itemObject = found end
                     end)
                 end
-
                 if itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
                     params.item = itemObject
                 end
@@ -499,10 +825,60 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                 if isStackable then params.stackable = true end
                 pcall(function() activeSpells:add(params) end)
             end
+
             local effCount = spell.effects and #spell.effects or 0
             debugLog(string.format("Successfully added %s (%d effect(s))", spellId, effCount))
 
-            -- [TRACKING] Register spell for lifecycle events
+            local scale = coerceEffectScale(effectScale)
+            if scale < 1 and scale > 0 and spell.effects and effectIndexes then
+                local targetRef = target
+                local spellRef = spell
+                local idxList = effectIndexes
+                local scaleRef = scale
+                async:newUnsavableSimulationTimer(0, function()
+                    if not targetRef or not targetRef:isValid() then return end
+                    local ae = types.Actor.activeEffects(targetRef)
+                    if not ae then return end
+                    for _, idx in ipairs(idxList) do
+                        local rawEff = spellRef.effects[idx + 1]
+                        if rawEff then
+                            local candidates = magicEffectIdCandidates(rawEff)
+                            local extra = magicEffectExtraParam(rawEff)
+                            if #candidates == 0 then
+                                debugLog("effect scale: no effect id candidates for spell index " .. tostring(idx))
+                            else
+                                local avgMag = ((rawEff.magnitudeMin or 0) + (rawEff.magnitudeMax or rawEff.magnitudeMin or 0)) * 0.5
+                                local reduceBy = avgMag * (1 - scaleRef)
+                                if reduceBy > 0 then
+                                    local useId = pickEffectIdForModify(ae, candidates, extra)
+                                    if useId then
+                                        pcall(function() ae:modify(-reduceBy, useId, extra) end)
+                                    end
+                                end
+                                local rawDuration = rawEff.duration or 0
+                                if rawDuration > 0 then
+                                    local scaledDuration = math.max(1, math.floor((rawDuration * scaleRef) + 0.5))
+                                    if scaledDuration < rawDuration and avgMag > 0 then
+                                        local scaledMagnitude = avgMag * scaleRef
+                                        local useId = pickEffectIdForModify(ae, candidates, extra)
+                                        local tr = targetRef
+                                        local ex = extra
+                                        async:newUnsavableSimulationTimer(scaledDuration, function()
+                                            if tr and tr:isValid() and useId then
+                                                local ae2 = types.Actor.activeEffects(tr)
+                                                if ae2 then
+                                                    pcall(function() ae2:modify(-scaledMagnitude, useId, ex) end)
+                                                end
+                                            end
+                                        end)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+
             if not trackedEffectRegistry[target] then trackedEffectRegistry[target] = {} end
             local trackingData = {
                 caster    = caster,
@@ -530,13 +906,20 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             end
             trackedEffectRegistry[target][spellId] = trackingData
 
-            -- [FEATURE 3] continuousVfx: register persistent cast VFX on the target.
-            -- The VFX is tracked in activeVfxRegistry and cleaned up when the spell expires.
             if continuousVfx then
                 if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
                 activeVfxRegistry[target.id][spellId] = target
-                -- Spawn the cast glow VFX model attached to the target
-                local pfx = spell and spell.effects and spell.effects[1] and spell.effects[1].id
+
+                local vfxTag = "MagExp_" .. spellId
+                continuousVfxActors[target.id] = {
+                    actor            = target,
+                    spellId          = spellId,
+                    vfxTag           = vfxTag,
+                    registrationTime = core.getGameTime()
+                }
+                debugLog(string.format("[continuousVfx] Registered actor %s with VFX %s", target.recordId or "unknown", vfxTag))
+
+                local pfx = primaryApplied and primaryApplied.id
                 local pmgef = pfx and core.magic.effects.records[pfx]
                 local castVfxId = (pmgef and pmgef.castVfx and pmgef.castVfx ~= "") and pmgef.castVfx or nil
                 if castVfxId then
@@ -546,8 +929,8 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                         pcall(function()
                             world.vfx.spawn(rec.model, target.position, {
                                 attachToObject = target,
-                                mwMagicVfx = false,
-                                tag = "MagExp_" .. spellId,
+                                mwMagicVfx    = false,
+                                tag           = vfxTag,
                             })
                         end)
                     end
@@ -555,109 +938,13 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                 debugLog(string.format("[continuousVfx] Registered persistent VFX for %s on %s", spellId, target.recordId))
             end
 
-            -- Handle casterLinked effects: track for removal on caster death
             if hasCasterLinked then
                 print("MagExp: Tracking casterLinked spell " .. spellId .. " on " .. target.recordId)
-                table.insert(casterLinkedSpells, {caster = caster, target = target, spellId = spellId})
+                table.insert(casterLinkedSpells, { caster = caster, target = target, spellId = spellId })
             end
         end
     end)
     if not ok then debugLog("Spell Application Error: " .. tostring(err)) end
-
-    -- Visual Effects (Manual fallback)
-    local ok2, err2 = pcall(function()
-        local vfxPos = hitPos
-        if not vfxPos or isAoe then
-            local tStr = tostring(target.type)
-            if tStr:find("NPC") or tStr:find("Creature") or tStr:find("Player") then
-                local zOffset = heightCache[target.id]
-                if not zOffset then
-                    zOffset = 45 -- Lowered fallback significantly (waist level)
-                    pcall(function()
-                        local bbox = target:getBoundingBox()
-                        if bbox then
-                            zOffset = bbox.halfSize.z * 1.1 -- Roughly 0.55 of full height
-                            if zOffset > 105 then zOffset = 65 end
-                        end
-                    end)
-                    heightCache[target.id] = zOffset
-                end
-                vfxPos = target.position + util.vector3(0, 0, zOffset)
-            else
-                vfxPos = target.position
-            end
-        end
-
-        if spell.effects and spell.effects[1] then
-            local mgef = core.magic.effects.records[spell.effects[1].id]
-            if mgef then
-                -- 1. Determine school name 's' for VFX and sound fallbacks
-                local schoolIdx = mgef.school
-                local s = "destruction"
-                if type(schoolIdx) == "string" then s = schoolIdx:lower()
-                elseif type(schoolIdx) == "number" then
-                    local schools = { [0]="alteration", [1]="conjuration", [2]="destruction", [3]="illusion", [4]="mysticism", [5]="restoration" }
-                    s = schools[schoolIdx] or "destruction"
-                end
-
-                if not isAoe then
-                    local hitVfxId = (mgef.hitVfx and mgef.hitVfx ~= "") and mgef.hitVfx or nil
-                    if not hitVfxId then
-
-                        -- 2. Detect Elemental Identity (regardless of school)
-                        local n = (mgef.name or ""):lower()
-                        local eid = tostring(mgef.id):lower()
-                        local element = nil
-                        if     n:find("fire")   or eid:find("fire")   then element = "Fire"
-                        elseif n:find("frost")  or eid:find("frost")  or n:find("cold") or eid:find("cold") then element = "Frost"
-                        elseif n:find("shock")  or eid:find("shock")  or n:find("lightn") then element = "Lightning"
-                        elseif n:find("poison") or eid:find("poison") then element = "Poison"
-                        end
-
-                        -- 3. Resolve Hit VFX based on Priority: Element > School > Default
-                        if element then
-                            hitVfxId = "VFX_" .. element .. "Hit"
-                        else
-                            if s == "destruction" then hitVfxId = "VFX_DestructHit"
-                            elseif s == "alteration"  then hitVfxId = "VFX_AlterationHit"
-                            elseif s == "conjuration" then hitVfxId = "VFX_ConjureHit"
-                            elseif s == "illusion"    then hitVfxId = "VFX_IllusionHit"
-                            elseif s == "mysticism"   then hitVfxId = "VFX_MysticismHit"
-                            elseif s == "restoration" then hitVfxId = "VFX_RestorationHit"
-                            else hitVfxId = "VFX_DefaultHit" end
-                        end
-
-                        -- 4. Record Existence Sanity Check (Case-insensitive)
-                        local lId = tostring(hitVfxId):lower()
-                        if not (types.Static.records[lId] or types.Weapon.records[lId]) then
-                            if hitVfxId:find("Hit") then 
-                                hitVfxId = "VFX_DefaultHit" 
-                            end
-                        end
-                    end
-
-                    if hitVfxId then
-                        local rid = tostring(hitVfxId):lower()
-                        local rec = types.Static.records[rid] or types.Weapon.records[rid]
-                        if rec and rec.model then
-                            local opts = { mwMagicVfx = false }
-                            -- Only attach if the target is still valid and enabled to avoid "disabled object" errors
-                            if target:isValid() and target.enabled then
-                                opts.attachToObject = target
-                            end
-                            world.vfx.spawn(rec.model, vfxPos, opts)
-                        end
-                    end
-                end
-                
-                if not muteAudio and target.enabled then
-                    local sndId = (mgef.hitSound and mgef.hitSound ~= "") and mgef.hitSound or (tostring(s):lower() .. " hit")
-                    pcall(function() core.sound.playSound3d(sndId, target, { volume = 1.0 }) end)
-                end
-            end
-        end
-    end)
-    if not ok2 then debugLog("VFX Logic Error: " .. tostring(err2)) end
 end
 
 local function getObjectCenter(obj)
@@ -669,6 +956,31 @@ local function getObjectCenter(obj)
         return bbox.center, r
     end
     return pos, 0
+end
+
+-- ============================================================
+-- [INTERNAL] Max area statistic among a subset of spell effects (records use area fields).
+-- ============================================================
+local function maxAreaAmongIndexes(spell, idxList)
+    local m = 0
+    if not spell or not spell.effects or not idxList then return 0 end
+    for _, idx in ipairs(idxList) do
+        local eff = spell.effects[idx + 1]
+        if eff and type(eff.area) == "number" then m = math.max(m, eff.area) end
+    end
+    return m
+end
+
+--- Prefer the forced index whose effect has largest area (for AoE visuals / blast metadata).
+local function dominantAreaEffectIndex(spell, idxList)
+    if not spell or not spell.effects or not idxList or #idxList == 0 then return 0 end
+    local bestA, pick = -1, idxList[1]
+    for _, ix in ipairs(idxList) do
+        local e = spell.effects[ix + 1]
+        local a = (e and type(e.area) == "number") and e.area or 0
+        if a > bestA then bestA = a; pick = ix end
+    end
+    return pick
 end
 
 -- ============================================================
@@ -726,7 +1038,7 @@ end
 -- ============================================================
 -- [AOE] Detonate spell at world position
 -- ============================================================
-local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx)
+local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale)
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell and spellId then
         -- Safe iterative fallback for numerical proxies or case-sensitivity edge cases
@@ -750,15 +1062,19 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
     local maxArea = 0
     local AREA_MULT = (core.getGMST("fAreaRadiusMult") or 1.0) * 22.1
 
-    if spell.effects and spell.effects[1] then
+    if forcedEffects and #forcedEffects > 0 then
+        maxArea = maxAreaAmongIndexes(spell, forcedEffects)
+    elseif spell.effects and spell.effects[1] then
         maxArea = (spell.effects[1] and spell.effects[1].area) or 0
     end
     if maxArea <= 0 then return end
 
     local finalRadius = maxArea * AREA_MULT
 
-    if spell.effects[1] then
-        local mgef = core.magic.effects.records[spell.effects[1].id]
+    local areaVfxIx = dominantAreaEffectIndex(spell, forcedEffects)
+    local areaVfxEff = spell.effects and spell.effects[areaVfxIx + 1]
+    if areaVfxEff then
+        local mgef = core.magic.effects.records[areaVfxEff.id]
         if mgef then
             local areaStaticId = vfxOverride
             
@@ -874,7 +1190,7 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                         handleDoorLockUnlock(spellId, caster, object)
                         affectedCount = affectedCount + 1
                     elseif isActor and not isLockUnlock and not (types.Actor.objectIsInstance(object) and types.Actor.isDead(object)) then
-                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)
+                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale)
                         -- Broadcast AoE hit
                         fireMagicHitEvent({
                             attacker  = caster,
@@ -884,6 +1200,7 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                             spellType = core.magic.RANGE.Target,
                             isAoE     = true,
                             area      = finalRadius,
+                            effectIndex = dominantAreaEffectIndex(spell, forcedEffects),
                             impactSpeed = impactSpeed, -- Forward projectile speed to the blast event
                             maxSpeed  = maxSpeed,
                             unreflectable = unreflectable,
@@ -904,8 +1221,9 @@ end
 -- ============================================================
 -- [INTERNAL] Auto-detect bolt VFX/sound/spin from a spell record
 -- Returns a table of defaults that launchSpell can override.
+-- primaryEffectIndex: optional 0-based index into spell.effects for mixed-range spells (default first effect).
 -- ============================================================
-local function autoDetectProjectileParams(spell)
+local function autoDetectProjectileParams(spell, primaryEffectIndex)
     local out = {
         mgef        = nil,
         school      = "destruction",
@@ -921,9 +1239,11 @@ local function autoDetectProjectileParams(spell)
         spinSpeed   = 0,
     }
 
-    if not (spell and spell.effects and spell.effects[1]) then return out end
+    local pi = primaryEffectIndex or 0
+    local primEff = spell and spell.effects and spell.effects[pi + 1]
+    if not primEff then return out end
 
-    local mgef = core.magic.effects.records[spell.effects[1].id]
+    local mgef = core.magic.effects.records[primEff.id]
     local school = (mgef and mgef.school) or "destruction"
     local n      = mgef and (mgef.name or ""):lower() or ""
     out.mgef   = mgef
@@ -1118,6 +1438,7 @@ local function launchSpell(data)
 
     if not attacker or not spellId or not startPos or not direction then
         debugLog("launchSpell: missing required data (attacker, spellId, startPos, direction)")
+        --playerNotifyCastIssue(attacker, "Cast failed (invalid spell data).")
         return
     end
 
@@ -1170,6 +1491,7 @@ local function launchSpell(data)
 
     if not spell then
         print("[MagExp] launchSpell ERROR: spell/enchantment record not found: " .. tostring(spellId))
+        --playerNotifyCastIssue(attacker, "You cannot cast that spell.")
         return
     end
 
@@ -1194,17 +1516,36 @@ local function launchSpell(data)
     end
 
     -- [RESOURCE GUARD] (skipped when isFree = true)
-    if not data.isFree then
+    if not data.isFree and not data.isGodMode then
         local cost = spell.cost or 0
         local isEnchantment = core.magic.enchantments.records[spellId] ~= nil
-        
-        if isEnchantment and itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
+        local resolvedItem = itemObject
+        if isEnchantment then
+            local inv = types.Actor.inventory(attacker)
+            if type(resolvedItem) == "string" and inv then
+                resolvedItem = inv:find(resolvedItem)
+            end
+            if (not resolvedItem or type(resolvedItem) == "string" or not resolvedItem:isValid()) and data.itemRecordId and inv then
+                resolvedItem = inv:find(data.itemRecordId)
+            end
+        end
+
+        if isEnchantment then
+            if not (resolvedItem and type(resolvedItem) ~= "string" and resolvedItem:isValid()) then
+                if attacker.type == types.Player then
+                    attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
+                end
+                debugLog("Enchantment failure: no valid enchanted item for " .. tostring(spellId))
+                return
+            end
             if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
                 -- Scroll / Cast Once Check: Consume 1 item
-                if itemObject.count > 0 then
-                    if attacker.type == types.Player then
-                        attacker:sendEvent('MagExp_ConsumeResource', { itemCountCost = 1, itemRecordId = itemObject.recordId })
-                    end
+                if resolvedItem.count > 0 then
+                    magExpApplyInventoryResourceConsumption(attacker, {
+                        item = resolvedItem,
+                        itemCountCost = 1,
+                        itemRecordId = resolvedItem.recordId,
+                    })
                 else
                     if attacker.type == types.Player then
                         attacker:sendEvent('Ui_ShowMessage', "You do not have enough of that item.")
@@ -1223,7 +1564,10 @@ local function launchSpell(data)
                 end)
                 cost = math.max(1, math.floor(0.01 * (110 - skill) * cost))
                 
-                local currentCharge = types.Item.enchantmentCharge(itemObject) or 0
+                local currentCharge, haveCharge = magExpReadItemEnchantmentCharge(resolvedItem)
+                if not haveCharge then
+                    currentCharge = spell.charge or 0
+                end
                 if currentCharge < cost then
                     if attacker.type == types.Player then
                         attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
@@ -1231,11 +1575,14 @@ local function launchSpell(data)
                     debugLog("Enchantment failure: " .. spellId .. " requires " .. cost .. " charges, has " .. currentCharge)
                     return
                 end
-                -- [DEDUCTION]
-                if attacker.type == types.Player then
-                    attacker:sendEvent('MagExp_ConsumeResource', { itemChargeCost = cost, itemRecordId = itemObject.recordId })
-                end
+                -- [DEDUCTION] (global script — required for item charge writes)
+                magExpApplyInventoryResourceConsumption(attacker, {
+                    item = resolvedItem,
+                    itemChargeCost = cost,
+                    itemRecordId = resolvedItem.recordId,
+                })
             end
+            itemObject = resolvedItem
         else
             -- Magicka Check
             local magicka = (attacker.type == types.Player)
@@ -1306,46 +1653,24 @@ local function launchSpell(data)
     end
 
 
-    -- Routing type and area: accept caller override, otherwise read from spell
-    local routingType = data.spellType
-    local area        = data.area
-    if routingType == nil and spell.effects and #spell.effects > 0 then
-        routingType = spell.effects[1].range
-    end
-    if area == nil and spell.effects and #spell.effects > 0 then
-        area = spell.effects[1].area or 0
-    end
-    routingType = routingType or core.magic.RANGE.Target
-    area  = area  or 0
+    local effectScale = coerceEffectScale(data.effectScale)
 
-    -- Split effects by range: Self effects apply immediately to caster
-    local selfIndexes = {}
-    local otherIndexes = {}
+    -- Partition by per-effect range: Self only on caster; Touch only on hitObject; Target only via projectile indices.
+    local selfIndexes, touchIndexes, targetIndexes = {}, {}, {}
     if spell.effects then
         for i, eff in ipairs(spell.effects) do
-            if eff.range == core.magic.RANGE.Self then
-                table.insert(selfIndexes, i - 1)
+            local ix = i - 1
+            if spellEffectRangeIsSelf(eff.range) then
+                table.insert(selfIndexes, ix)
+            elseif eff.range == core.magic.RANGE.Touch then
+                table.insert(touchIndexes, ix)
             else
-                table.insert(otherIndexes, i - 1)
+                table.insert(targetIndexes, ix)
             end
         end
     end
 
-    -- [SPLIT-RANGE APPLICATION]
-    -- If there are Self effects and we are doing a non-Self routing, apply Self parts to attacker now.
-    if #selfIndexes > 0 and routingType ~= core.magic.RANGE.Self then
-        debugLog(string.format("Splitting %d Self effects from %s", #selfIndexes, spellId))
-        applySpellToActor(spellId, attacker, attacker, nil, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx)
-        
-        -- If no non-Self effects remain, we're done.
-        if #otherIndexes == 0 then return end
-    end
-
-    -- If we have other effects, use them for the subsequent routing
-    local effectIndexes = #otherIndexes > 0 and otherIndexes or nil
-
-    -- ---- SELF ----
-    if routingType == core.magic.RANGE.Self then
+    local function casterTorsoPosition()
         local zOffset = 95
         pcall(function()
             local bbox = attacker:getBoundingBox()
@@ -1354,34 +1679,46 @@ local function launchSpell(data)
                 if zOffset > 105 then zOffset = 100 end
             end
         end)
-        local torsoPos = attacker.position + util.vector3(0, 0, zOffset)
-        debugLog("Self routing hit-pos: " .. tostring(torsoPos))
-        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, nil, data.userData, data.muteAudio, data.muteLight, data.continuousVfx) end
-        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx)
+        return attacker.position + util.vector3(0, 0, zOffset)
+    end
+
+    if #selfIndexes > 0 then
+        debugLog(string.format("Applying %d Self effect(s) on caster only for %s", #selfIndexes, spellId))
+        local torsoPos = casterTorsoPosition()
+        local selfArea = maxAreaAmongIndexes(spell, selfIndexes)
+        if effectScale < 1 then
+            selfArea = math.max(0, math.floor(selfArea * effectScale + 0.5))
+        end
+        if selfArea > 0 then
+            detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, selfIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, nil, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+        end
+        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, data)
+    end
+
+    if #touchIndexes == 0 and #targetIndexes == 0 then
         return
     end
 
-    -- ---- TOUCH ----
-    if routingType == core.magic.RANGE.Touch then
-        -- [SHARED-RAY AUTHORITATIVITY] 
-        -- Rely on the player script to provide a precision hitObject from the 
-        -- camera-accurate SharedRay service.
-        local obj = data.hitObject
-        
-        if obj and obj:isValid() then
-            local spellIsLockUnlock = false
-            local spellIsUniversal  = false
-            if spell.effects then
-                for _, eff in ipairs(spell.effects) do
+    local function spellFlagsFromEffectIndexes(idxList)
+        local spellIsLockUnlock, spellIsUniversal = false, false
+        if spell.effects and idxList then
+            for _, ix in ipairs(idxList) do
+                local eff = spell.effects[ix + 1]
+                if eff then
                     local eid = tostring(eff.id):lower()
-                    if STACK_CONFIG.LOCKABLE_EFFECTS[eid] then 
-                        spellIsLockUnlock = true 
-                    end
-                    if STACK_CONFIG.UNIVERSAL_EFFECTS[eid] then
-                        spellIsUniversal = true
-                    end
+                    if STACK_CONFIG.LOCKABLE_EFFECTS[eid] then spellIsLockUnlock = true end
+                    if STACK_CONFIG.UNIVERSAL_EFFECTS[eid] then spellIsUniversal = true end
                 end
             end
+        end
+        return spellIsLockUnlock, spellIsUniversal
+    end
+
+    -- ---- TOUCH ---- (only indexes in touchIndexes; Target effects are handled by projectile below)
+    if #touchIndexes > 0 then
+        local obj = data.hitObject
+        if obj and obj:isValid() then
+            local spellIsLockUnlock, spellIsUniversal = spellFlagsFromEffectIndexes(touchIndexes)
 
             local isLockable = (obj.type == types.Door or obj.type == types.Container)
             local isActor    = (obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player)
@@ -1393,27 +1730,32 @@ local function launchSpell(data)
                 if isActor then
                     local zOffset = 95
                     pcall(function()
-                    local bbox = obj:getBoundingBox()
-                    if bbox then
-                        zOffset = bbox.halfSize.z
-                        if zOffset > 105 then zOffset = 100 end
-                    end
+                        local bbox = obj:getBoundingBox()
+                        if bbox then
+                            zOffset = bbox.halfSize.z
+                            if zOffset > 105 then zOffset = 100 end
+                        end
                     end)
                     hitPos = obj.position + util.vector3(0, 0, zOffset)
                 end
 
-                if spellIsLockUnlock then
-                    -- Use authoritative interaction handler for Lock/Unlock/Disarm
-                    handleDoorLockUnlock(spellId, attacker, obj)
-                elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
-                    if area > 0 then detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, obj, data.userData) end
-                    applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked, data.userData)
+                local touchArea = maxAreaAmongIndexes(spell, touchIndexes)
+                if effectScale < 1 then
+                    touchArea = math.max(0, math.floor(touchArea * effectScale + 0.5))
                 end
 
-                -- [VFX FOR TOUCH] Only for valid targets
-                -- Universal spells trigger on anything. Lock spells on Lockables. Normal spells on Actors.
-                local isProperTarget = spellIsUniversal or (spellIsLockUnlock and isLockable) or (not spellIsLockUnlock and isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)))
-                
+                if spellIsLockUnlock then
+                    handleDoorLockUnlock(spellId, attacker, obj)
+                elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
+                    if touchArea > 0 then
+                        detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+                    end
+                    applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, touchIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+                end
+
+                local isProperTarget = spellIsUniversal or (spellIsLockUnlock and isLockable)
+                    or (not spellIsLockUnlock and isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)))
+
                 if isProperTarget then
                     fireMagicHitEvent({
                         attacker   = attacker,
@@ -1422,22 +1764,40 @@ local function launchSpell(data)
                         itemObject = itemObject,
                         hitPos     = hitPos,
                         isAoE      = false,
-                        area       = area,
+                        area       = touchArea,
                         spellType  = core.magic.RANGE.Touch,
+                        effectIndex = touchIndexes[1],
                         unreflectable = data.unreflectable,
                         casterLinked = data.casterLinked,
                         userData   = data.userData
                     })
                 end
-                return
             end
         end
+
+        -- Pure Touch spell with no projectile leg: behavior matches vanilla (need valid touch when no Target effects).
+        if #targetIndexes == 0 then
+            return
+        end
+    end
+
+    if #targetIndexes == 0 then
         return
     end
 
-    -- ---- TARGET (projectile) ----
-    -- Auto-detect all VFX/sound/physics params from the spell, then apply caller overrides
-    local auto = autoDetectProjectileParams(spell)
+    -- ---- TARGET (projectile): only Target-range effect indices ----
+    local area = data.area
+    if area == nil then
+        area = maxAreaAmongIndexes(spell, targetIndexes)
+    end
+    area = area or 0
+    if effectScale < 1 then
+        area = math.max(0, math.floor(area * effectScale + 0.5))
+    end
+
+    local effectIndexes = targetIndexes
+
+    local auto = autoDetectProjectileParams(spell, targetIndexes[1])
 
     local vfxRecId    = data.vfxRecId    or auto.vfxRecId
     local areaVfxRecId= data.areaVfxRecId or (auto.areaVfxRecId ~= "" and auto.areaVfxRecId or nil)
@@ -1453,6 +1813,22 @@ local function launchSpell(data)
     local speed       = data.speed or auto.speed or 1500
     local maxLifetime = data.maxLifetime or 10
     local spawnOffset = data.spawnOffset or 80
+    
+    -- Point-blank range detection: reduce spawnOffset for close targets to prevent collision issues
+    local estimatedTargetDistance = 0
+    if data.hitObject and data.hitObject:isValid() then
+        local targetPos = getObjectCenter(data.hitObject) or data.hitObject.position
+        estimatedTargetDistance = (targetPos - startPos):length()
+    elseif data.hitPos then
+        estimatedTargetDistance = (data.hitPos - startPos):length()
+    end
+    
+    -- If target is very close (point-blank range), use smaller spawn offset
+    if estimatedTargetDistance > 0 and estimatedTargetDistance < 100 then
+        spawnOffset = 10
+        debugLog(string.format("Point-blank range detected (%.1f units), using reduced spawnOffset: %d for %s", estimatedTargetDistance, spawnOffset, spellId))
+    end
+    
     local recordId    = data.projectileRecordId or "Colony_Assassin_act"
 
     local dir      = direction:normalize()
@@ -1518,6 +1894,7 @@ local function launchSpell(data)
         spellId     = spellId,
         itemRecordId = itemRecordId,
         effectIndexes = effectIndexes,
+        effectScale   = effectScale,
         area        = area,
         -- Audio
         boltSound   = boltSound,
@@ -1638,7 +2015,7 @@ local function onProjectileCollision(data)
     local effectIndexes = data.effectIndexes
     -- [ORDER: Detonation First]
     if area > 0 then
-        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, data.areaVfxRecId or data.vfxRecId, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight, data.continuousVfx)
+        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, data.areaVfxRecId or data.vfxRecId, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale)
     end
 
     -- [ORDER: Interaction / Direct Hit Second]
@@ -1648,7 +2025,7 @@ local function onProjectileCollision(data)
     if spellIsLockUnlock and isLockable then
         handleDoorLockUnlock(spellId, attacker, target)
     elseif isActor and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
-        applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx)
+        applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale)
     end
 
     -- [MAXYARI] Physics impulse on detonation
@@ -1681,6 +2058,7 @@ local function onProjectileCollision(data)
         spellType     = core.magic.RANGE.Target,
         isAoE         = false,
         area          = area,
+        effectIndex   = effectIndexes and effectIndexes[1],
         unreflectable = data.unreflectable,
         casterLinked  = data.casterLinked,
         userData      = userData,
@@ -1715,102 +2093,99 @@ local function onUpdate(dt)
         end
     end
 
-    -- [PERSISTENT VFX CLEANUP] Pulsed every 0.1s
-    local gameTime = core.getSimulationTime()
-    if not MagExp_NextCleanup or gameTime > MagExp_NextCleanup then
-        MagExp_NextCleanup = gameTime + 0.1
-        for targetId, spells in pairs(activeVfxRegistry) do
-            local anyRemaining = false
-            for spellId, target in pairs(spells) do
-                if not target:isValid() then
-                    spells[spellId] = nil
-                else
-                    local isActive = false
-                    pcall(function()
-                        local as = types.Actor.activeSpells(target)
-                        if as then
-                            for _, inst in pairs(as) do
-                                if inst.id == spellId then
-                                    isActive = true
-                                    break
-                                end
-                            end
-                        end
-                    end)
-                    
-                    if not isActive then
-                        target:sendEvent('RemoveVfx', "MagExp_" .. spellId)
-                        spells[spellId] = nil
-                    else
-                        anyRemaining = true
-                    end
-                end
-            end
-            if not anyRemaining then activeVfxRegistry[targetId] = nil end
-        end
-
-        -- [LIFECYCLE TRACKING] onEffectTick & onEffectOver
-        for target, spells in pairs(trackedEffectRegistry) do
-            if not target or not target:isValid() or (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
-                -- Actor is gone or dead: Fire onEffectOver for all tracked spells
-                for spellId, data in pairs(spells) do
-                    for _, eff in ipairs(data.effects) do
-                        fireEffectEvent('onEffectOver', target, eff)
-                    end
-                end
-                trackedEffectRegistry[target] = nil
-            else
-                local activeSpells = types.Actor.activeSpells(target)
-                for spellId, data in pairs(spells) do
-                    local isActive = false
-                    if activeSpells then
-                        for sId, _ in pairs(activeSpells) do
-                            if sId == spellId then isActive = true; break end
-                        end
-                    end
-
-                    if not isActive then
-                        -- Spell has expired or been removed
-                        for _, eff in ipairs(data.effects) do
-                            fireEffectEvent('onEffectOver', target, eff)
-                        end
-                        spells[spellId] = nil
-                    else
-                        -- Still active: Fire onEffectTick
-                        for _, eff in ipairs(data.effects) do
-                            fireEffectEvent('onEffectTick', target, eff)
-                        end
-                    end
-                end
-                -- Clean up empty target entries
-                if next(spells) == nil then trackedEffectRegistry[target] = nil end
+ -- [NEW] continuousVFX Actor Registry Cleanup
+ for actorId, regData in pairs(continuousVfxActors) do
+    local actor = regData.actor
+    local spellId = regData.spellId
+    local vfxTag = regData.vfxTag
+    
+    if not actor or not actor:isValid() then
+        debugLog("[continuousVFX Registry] Removing invalid actor: " .. actorId)
+        continuousVfxActors[actorId] = nil
+     else
+        local isActive = false
+        local activeSpells = types.Actor.activeSpells(actor)
+        if activeSpells then
+            for sId, _ in pairs(activeSpells) do
+                if sId == spellId then isActive = true; break end
             end
         end
-
-        -- [CASTER LINKED CLEANUP] Remove casterLinked spells if caster dies
-        for i = #casterLinkedSpells, 1, -1 do
-            local link = casterLinkedSpells[i]
-            local caster = link.caster
-            local isCasterDead = false
-            if not caster or not caster:isValid() then
-                isCasterDead = true
-            elseif types.Actor.objectIsInstance(caster) then
-                if types.Actor.isDead(caster) then
-                    isCasterDead = true
-                end
-            end
-            if isCasterDead then
-                local target = link.target
-                if target and target:isValid() then
-                    pcall(function()
-                        local activeSpells = types.Actor.activeSpells(target)
-                        if activeSpells then activeSpells:remove(link.spellId) end
-                    end)
-                end
-                table.remove(casterLinkedSpells, i)
-            end
+        
+        if not isActive then
+            debugLog(string.format("[continuousVFX Registry] Removing VFX %s from %s (spell expired)", vfxTag, actor.recordId or "unknown"))
+            
+            -- Send RemoveVfx event to actor's local script
+            pcall(function()
+                actor:sendEvent('RemoveVfx', vfxTag)
+            end)
+            
+            -- Also clean world.vfx registry (for cast glow spawned via world.vfx.spawn)
+            pcall(function()
+                world.vfx.remove(vfxTag)
+            end)
+            
+            continuousVfxActors[actorId] = nil
+            debugLog("[continuousVFX Registry] Unregistered actor: " .. actorId)
         end
     end
+end
+
+ -- [PERSISTENT VFX CLEANUP] Pulsed every 0.1s (legacy system)
+ local gameTime = core.getSimulationTime()
+ if not MagExp_NextCleanup or gameTime > MagExp_NextCleanup then
+    MagExp_NextCleanup = gameTime + 0.1
+    for targetId, spells in pairs(activeVfxRegistry) do
+        local anyRemaining = false
+        for regKey, val in pairs(spells) do
+            local tgt, spellKey, removeVfxId
+            if type(val) == "table" and val.target ~= nil and val.spellId ~= nil then
+                tgt = val.target
+                spellKey = val.spellId
+                removeVfxId = regKey
+            else
+                tgt = val
+                spellKey = regKey
+                removeVfxId = "MagExp_" .. tostring(regKey)
+            end
+
+            if not tgt or not tgt:isValid() then
+                spells[regKey] = nil
+            else
+                local isActive = false
+                pcall(function()
+                    local as = types.Actor.activeSpells(tgt)
+                    if as then
+                        for _, inst in pairs(as) do
+                            if inst.id == spellKey then
+                                isActive = true
+                                break
+                            end
+                        end
+                    end
+                end)
+
+                if not isActive then
+                    debugLog(string.format("[VFX Cleanup] Removing VFX '%s' from %s (spell: %s)", removeVfxId, tgt.recordId or "unknown", spellKey))
+                    
+                    -- Send RemoveVfx event to actor's local script (handles anim-based VFX)
+                    pcall(function()
+                        tgt:sendEvent('RemoveVfx', removeVfxId)
+                    end)
+                    
+                    -- Also clean world.vfx registry (for world-spawned VFX)
+                    pcall(function()
+                        world.vfx.remove(removeVfxId)
+                    end)
+                    
+                    spells[regKey] = nil
+                else
+                    anyRemaining = true
+                end
+            end
+        end
+        if not anyRemaining then activeVfxRegistry[targetId] = nil end
+    end
+end
 end
 
 -- ============================================================
@@ -1885,6 +2260,11 @@ local MagExpPublicInterface = {
     --- Trigger an AoE blast at a world position.
     -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, vfxOverride string, impactSpeed number, maxSpeed number, areaVfxScale number, excludeTarget Object, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean
     detonateSpellAtPos = detonateSpellAtPos,
+
+    --- Apply scroll consumption or enchantment charge deduction. Must run from global script context;
+    --- player scripts should call this via I.MagExp.applyResourceConsumption(actor, data).
+    -- @param data table: { itemCountCost?, itemRecordId?, itemChargeCost? }
+    applyResourceConsumption = magExpApplyInventoryResourceConsumption,
 
     --- Register a custom target filter. Returns true/false to allow/block hits.
     addTargetFilter = function(f) table.insert(customFilters, f) end,
@@ -2083,6 +2463,13 @@ return {
         onUpdate = onUpdate,
     },
     eventHandlers = {
+        --- Inventory scroll/charge consumption from player scripts (must run globally).
+        -- data: { attacker, item?, itemCountCost?, itemRecordId?, itemChargeCost? }
+        MagExp_ApplyInventoryConsume = function(data)
+            local actor = data and (data.attacker or data.actor)
+            if actor then magExpApplyInventoryResourceConsumption(actor, data) end
+        end,
+
         --- Main spell launch event. Usable from player scripts via core.sendGlobalEvent.
         MagExp_CastRequest         = function(data) launchSpell(data) end,
         MagExp_ProjectileMove      = onProjectileMove,

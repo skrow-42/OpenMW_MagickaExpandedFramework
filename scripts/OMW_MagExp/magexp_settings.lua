@@ -5,7 +5,7 @@ if I.Settings and I.Settings.registerPage then
         I.Settings.registerPage({
             key         = 'MagExpPage',
             l10n        = 'MagExp',
-            name        = 'Spell Framework Plus 1.7',
+            name        = 'Spell Framework Plus 1.8',
             description = 'Framework settings for OMW Spell Framework Plus'
         })
     end)
