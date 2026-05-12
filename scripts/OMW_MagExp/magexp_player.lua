@@ -1,5 +1,5 @@
 -- ============================================================
--- OMW_MagExp: Magic Expansion Framework for OpenMW
+-- Spell Framework Plus for OpenMW
 -- magexp_player.lua (PLAYER script)
 -- ============================================================
 

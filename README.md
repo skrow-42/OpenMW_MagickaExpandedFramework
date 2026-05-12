@@ -1,5 +1,5 @@
-
-# SPELL FRAMEWORK PLUS (MagExp) v1.8
+```markdown
+# SPELL FRAMEWORK PLUS (MagExp) v1.81
 
 **SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It dehardcodes the magic system and provides a unified public interface (`I.MagExp`) for modders to trigger spell casts, control projectiles in flight, and hook into lifecycle events.
 
@@ -166,7 +166,7 @@ All fields except the first four are optional.
 | |
 | **Piercing** |
 | **piercing** | `boolean` | `false` | If `true`, the projectile passes through actors on contact, applying spell effects to each pierced actor, instead of stopping. Geometry collisions still cause normal detonation. |
-| **pierceLimit** | `int` / `nil` | `nil` | Maximum number of actors the projectile can pierce before it force-detonates. `nil` = unlimited (flies through all actors until lifetime or geometry). |
+| **pierceLimit** | `int` / `nil` | `nil` | Pass-through budget: number of actors the projectile can pierce before it force-detonates. `nil` = unlimited (flies through all actors until lifetime or geometry). |
 | |
 | **Audiovisual** |
 | **vfxRecId** | `string` | Auto | Bolt VFX record ID (auto-detected). |
@@ -326,23 +326,25 @@ When `piercing = true`, a projectile **passes through actors** instead of detona
 **Rules:**
 - **Actors**: Spell effects are applied on contact, but the projectile does **not** stop. The same actor cannot be pierced more than once per projectile (tracked internally per-projectile).
 - **Geometry**: Normal detonation (identical to non-piercing spells).
-- **`pierceLimit`**: If set to an integer, the projectile force-detonates after piercing that many actors. If `nil`, the projectile flies through unlimited actors until lifetime expires or geometry is hit.
+- **`pierceLimit`**: If set to an integer, it acts as a **pass-through budget**. The projectile will pierce through that many actors, then force-detonate on the **next** actor contact. If `nil`, the projectile flies through unlimited actors until lifetime expires or geometry is hit.
 - Each pierce fires the `MagExp_OnProjectilePierce` global event and the `I.MagExp.onProjectilePierce` hook.
 
 ```lua
--- Chain lightning that passes through up to 3 enemies
+-- Chain lightning that passes through 3 enemies, then detonates on the 4th
 I.MagExp.launchSpell({
     attacker    = actor,
     spellId     = "chain_lightning",
     startPos    = spawnPos, direction = dir,
     piercing    = true,
-    pierceLimit = 3,   -- passes through 3 actors, detonates on the 4th or at end of life
+    pierceLimit = 3,   -- pierce budget of 3: passes through actors 1-3, detonates on actor 4
 })
 
 -- Listen for pierces
 I.MagExp.onProjectilePierce = function(data)
     print("Pierced actor: " .. data.actor.recordId
        .. " (" .. data.pierceCount .. "/" .. tostring(data.pierceLimit or "∞") .. ")")
+    -- Note: When pierceCount reaches pierceLimit, the next actor will trigger
+    -- normal collision (isPierce = false) instead of another pierce event
 end
 ```
 
@@ -359,8 +361,8 @@ end
 | `hitNormal` | `Vector3` | Surface normal at contact. |
 | `velocity` | `Vector3` | Projectile velocity at time of pierce. |
 | `pierceCount` | `number` | How many actors have been pierced so far (including this one). |
-| `pierceLimit` | `int` / `nil` | The pierce cap, or `nil` if unlimited. |
-| `isPierce` | `boolean` | Always `true` in this hook. |
+| `pierceLimit` | `int` / `nil` | The pierce budget, or `nil` if unlimited. |
+| `isPierce` | `boolean` | Always `true` in this hook. When `false`, indicates a normal collision after the pierce budget was exhausted. |
 | `userData` | `table` | Custom launch cookie. |
 
 ### `setSpellPiercing` — In-Flight Pierce Control
@@ -382,6 +384,21 @@ I.MagExp.setSpellPiercing(projId, enabled, newLimit)
 local proj = I.MagExp.launchSpell({ ... })
 I.MagExp.setSpellPiercing(proj.id, true, 5)
 ```
+
+### Collision After Pierce Limit
+
+When a piercing projectile's `pierceLimit` budget is exhausted, the next actor contact triggers a **normal collision** instead of another pierce event. This collision follows the standard spell impact rules:
+
+- The projectile detonates normally on the actor
+- All standard collision events fire (`MagExp_OnMagicHit`, `MagExp_ProjectileCollision`)
+- The `isPierce` field in event data is set to `false` to indicate this is a normal impact
+- The collision data includes `pierceCount` and `pierceLimit` for context
+
+**Example Flow with `pierceLimit = 3`:**
+1. Actor 1 contact → `MagExp_OnProjectilePierce` (pierceCount=1, isPierce=true)
+2. Actor 2 contact → `MagExp_OnProjectilePierce` (pierceCount=2, isPierce=true)  
+3. Actor 3 contact → `MagExp_OnProjectilePierce` (pierceCount=3, isPierce=true)
+4. Actor 4 contact → `MagExp_OnMagicHit` + `MagExp_ProjectileCollision` (pierceCount=3, isPierce=false)
 
 > [!NOTE]
 > Piercing and bouncing are independent systems. A spell can have both `piercing = true` and `bounceEnabled = true` — it will pass through actors (applying effects) and bounce off geometry. If `detonateOnActorHit = false` is also set on a bouncing spell, piercing takes priority for actor contacts.
@@ -528,10 +545,10 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 | `stackCount` | `number` | Current instances after this hit. |
 | `proxyLookup` | `boolean` | True if resolved via iterative search. |
 | |
-| **Pierce Context (present only on pierce-through hits)** |
-| `isPierce` | `boolean` | `true` if this hit was from a piercing pass-through (not a final detonation). |
+| **Pierce Context** |
+| `isPierce` | `boolean` | `true` if this hit was from a piercing pass-through, `false` if this is a normal collision after the pierce budget was exhausted. |
 | `pierceCount` | `number` | How many actors have been pierced so far (including this one). |
-| `pierceLimit` | `int` / `nil` | The pierce cap, or `nil` if unlimited. |
+| `pierceLimit` | `int` / `nil` | The pierce budget, or `nil` if unlimited. |
 
 ### Robust Record Identification
 The framework uses a two-phase lookup system for `spellId`. If the engine cannot find a record by direct key (common when using numeric proxies in OSSC or Trap mods), SFP performs an iterative case-insensitive search to locate the correct spell or enchantment data. This ensures Area and Damage metadata is never lost.

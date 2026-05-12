@@ -1,5 +1,5 @@
 -- ============================================================
--- Magicka Expanded Framework for OpenMW v1.0 - skrow42
+-- Spell Framework Plus for OpenMW - skrow42
 -- magexp_global.lua (GLOBAL script)
 --
 -- Public Interface: I.MagExp
@@ -1430,26 +1430,38 @@ end
 -- }
 -- ============================================================
 local function launchSpell(data)
+    print("[MagExp] launchSpell called with spellId:", data.spellId)
     local attacker  = data.attacker
     local spellId   = data.spellId
     local itemObject = data.item or data.itemObject
     local startPos  = data.startPos
     local direction = data.direction
 
+    print("[MagExp] Parameter validation:")
+    print("  attacker:", attacker and (attacker:isValid() and "VALID" or "INVALID") or "NIL")
+    print("  spellId:", spellId and tostring(spellId) or "NIL")
+    print("  startPos:", startPos and tostring(startPos) or "NIL")
+    print("  direction:", direction and tostring(direction) or "NIL")
+    
     if not attacker or not spellId or not startPos or not direction then
         debugLog("launchSpell: missing required data (attacker, spellId, startPos, direction)")
+        print("[MagExp] EARLY RETURN - missing required parameters!")
         --playerNotifyCastIssue(attacker, "Cast failed (invalid spell data).")
         return
     end
+    print("[MagExp] Parameter validation passed!")
 
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    print("[MagExp] Direct spell lookup result:", spell and "FOUND" or "NOT FOUND")
     
     -- Fallback: Iterative search if the proxy is numerically indexed
     if not spell then
+        print("[MagExp] Trying fallback iterative search...")
         for _, rec in pairs(core.magic.spells.records) do
             local ok, recId = pcall(function() return rec.id end)
             if ok and recId and tostring(recId):lower() == tostring(spellId):lower() then
                 spell = rec
+                print("[MagExp] Found spell in fallback search!")
                 break
             end
         end
@@ -1459,6 +1471,7 @@ local function launchSpell(data)
             local ok, recId = pcall(function() return rec.id end)
             if ok and recId and tostring(recId):lower() == tostring(spellId):lower() then
                 spell = rec
+                print("[MagExp] Found spell in fallback search!")
                 break
             end
         end
@@ -1494,9 +1507,12 @@ local function launchSpell(data)
         --playerNotifyCastIssue(attacker, "You cannot cast that spell.")
         return
     end
+    print("[MagExp] Spell record found successfully!")
 
     -- [FEATURE 4] nonRecastable: silently abort if spell is already active on the caster.
+    print("[MagExp] Checking nonRecastable...")
     if data.nonRecastable then
+        print("[MagExp] nonRecastable is TRUE, checking active spells...")
         local isActive = false
         pcall(function()
             local as = types.Actor.activeSpells(attacker)
@@ -1510,13 +1526,21 @@ local function launchSpell(data)
             end
         end)
         if isActive then
+            print("[MagExp] Spell is already active, aborting cast")
             debugLog("nonRecastable: " .. spellId .. " already active on caster — aborting.")
             return
+        else
+            print("[MagExp] nonRecastable: spell is not active on caster")
         end
+    else
+        print("[MagExp] nonRecastable is FALSE or not set")
     end
+    print("[MagExp] nonRecastable check passed!")
 
     -- [RESOURCE GUARD] (skipped when isFree = true)
+    print("[MagExp] Checking resource guard, isFree:", data.isFree, "isGodMode:", data.isGodMode)
     if not data.isFree and not data.isGodMode then
+        print("[MagExp] Resource guard: checking costs and resources...")
         local cost = spell.cost or 0
         local isEnchantment = core.magic.enchantments.records[spellId] ~= nil
         local resolvedItem = itemObject
@@ -1531,13 +1555,16 @@ local function launchSpell(data)
         end
 
         if isEnchantment then
+            print("[MagExp] Spell is enchantment, checking item...")
             if not (resolvedItem and type(resolvedItem) ~= "string" and resolvedItem:isValid()) then
+                print("[MagExp] Enchantment failure: no valid enchanted item")
                 if attacker.type == types.Player then
                     attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
                 end
                 debugLog("Enchantment failure: no valid enchanted item for " .. tostring(spellId))
                 return
             end
+            print("[MagExp] Enchantment item validation passed!")
             if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
                 -- Scroll / Cast Once Check: Consume 1 item
                 if resolvedItem.count > 0 then
@@ -1585,11 +1612,14 @@ local function launchSpell(data)
             itemObject = resolvedItem
         else
             -- Magicka Check
+            print("[MagExp] Checking magicka cost...")
             local magicka = (attacker.type == types.Player)
                 and types.Player.stats.dynamic.magicka(attacker)
                 or  types.Actor.stats.dynamic.magicka(attacker)
-            
+            print("[MagExp] Current magicka:", magicka and magicka.current or "NIL", "Cost:", cost)
+            print("[MagExp] Comparison: magicka.current < cost =", magicka and magicka.current or "NIL", "<", cost)
             if magicka.current < cost then
+                print("[MagExp] Not enough magicka, returning early!")
                 if attacker.type == types.Player then
                     attacker:sendEvent('Ui_ShowMessage', "You don't have enough magicka")
                 end
@@ -1604,7 +1634,9 @@ local function launchSpell(data)
     end
     
     -- [ITEM REQUIREMENTS]
+    print("[MagExp] Checking item requirements...")
     if data.itemRequirements and types.Actor.objectIsInstance(attacker) then
+        print("[MagExp] Item requirements found, checking...")
         local inv = types.Actor.inventory(attacker)
         local spellName = (spell and spell.name) or spellId
         
@@ -1651,15 +1683,19 @@ local function launchSpell(data)
             end
         end
     end
-
+    print("[MagExp] Item requirements check passed!")
 
     local effectScale = coerceEffectScale(data.effectScale)
+    print("[MagExp] Effect scale:", effectScale)
 
     -- Partition by per-effect range: Self only on caster; Touch only on hitObject; Target only via projectile indices.
+    print("[MagExp] Partitioning spell effects...")
     local selfIndexes, touchIndexes, targetIndexes = {}, {}, {}
     if spell.effects then
+        print("[MagExp] Spell has", #spell.effects, "effects")
         for i, eff in ipairs(spell.effects) do
             local ix = i - 1
+            print("[MagExp] Effect", i, "range:", eff.range)
             if spellEffectRangeIsSelf(eff.range) then
                 table.insert(selfIndexes, ix)
             elseif eff.range == core.magic.RANGE.Touch then
@@ -1668,7 +1704,10 @@ local function launchSpell(data)
                 table.insert(targetIndexes, ix)
             end
         end
+    else
+        print("[MagExp] Spell has no effects!")
     end
+    print("[MagExp] Effects partitioned - Self:", #selfIndexes, "Touch:", #touchIndexes, "Target:", #targetIndexes)
 
     local function casterTorsoPosition()
         local zOffset = 95
@@ -1850,8 +1889,14 @@ local function launchSpell(data)
         end)
     end
 
+    print("[MagExp] Attempting to create projectile with recordId:", recordId)
     local proj = world.createObject(recordId, 1)
-    print("[MagExp] Created projectile object: " .. tostring(proj.id))
+    print("[MagExp] Created projectile object: " .. tostring(proj and proj.id or "NIL"))
+    if not proj or not proj:isValid() then
+        print("[MagExp] ERROR: Failed to create valid projectile object!")
+        return nil
+    end
+    print("[MagExp] Teleporting projectile to:", attacker.cell.name, spawnPos)
     pcall(function() proj:teleport(attacker.cell, spawnPos, rotation) end)
     -- [FIX] Store the live item object in a registry keyed by projectile ID.
     -- Passing itemObject.recordId (a string) loses the live object reference, which
@@ -1915,6 +1960,15 @@ local function launchSpell(data)
         muteAudio     = data.muteAudio,
         muteLight     = data.muteLight,
         continuousVfx = data.continuousVfx,
+        -- Bounce
+        bounceEnabled = data.bounceEnabled,
+        bounceMax     = data.bounceMax,
+        bouncePower   = data.bouncePower,
+        detonateOnActorHit = data.detonateOnActorHit,
+        -- Piercing
+        piercing      = data.piercing,
+        pierceLimit   = data.pierceLimit,
+        impactImpulse = data.impactImpulse,
     }
     if proj and proj:isValid() then
         proj:sendEvent('MagExp_InitProjectile', initPayload)
@@ -2278,6 +2332,8 @@ local MagExpPublicInterface = {
     onEffectOver       = function(actor, effect) end,
     --- Bounce hook (to be overridden by other mods)
     onProjectileBounce = function(data) end,
+    --- Pierce hook (to be overridden by other mods)
+    onProjectilePierce = function(data) end,
 
     -- ----------------------------------------------------------------
     -- In-flight Spell Control API
@@ -2352,6 +2408,17 @@ local MagExpPublicInterface = {
         local e = activeSpellRegistry[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', { detonateOnActorHit = value })
+        end
+    end,
+
+    --- Toggle piercing and/or change pierce cap on a live spell projectile.
+    setSpellPiercing = function(projId, enabled, newLimit)
+        local e = activeSpellRegistry[projId]
+        if e and e.projectile:isValid() then
+            e.projectile:sendEvent('MagExp_SetPhysics', {
+                piercing = enabled,
+                pierceLimit = newLimit
+            })
         end
     end,
 
@@ -2480,6 +2547,34 @@ return {
         MagExp_OnProjectileBounce  = function(data)
             if MagExpPublicInterface and MagExpPublicInterface.onProjectileBounce then
                 pcall(function() MagExpPublicInterface.onProjectileBounce(data) end)
+            end
+        end,
+
+        --- Pierce event: forwarded from local script when piercing through actors.
+        MagExp_OnProjectilePierce = function(data)
+            -- Apply spell effects to pierced actor
+            if data.hitObject and data.hitObject:isValid() then
+                applySpellToActor(
+                    data.spellId,
+                    data.attacker,
+                    data.hitObject,
+                    data.hitPos,
+                    false, -- not AoE
+                    nil, -- no item object
+                    data.effectIndexes,
+                    data.unreflectable,
+                    data.casterLinked,
+                    data.userData,
+                    data.muteAudio,
+                    data.muteLight,
+                    data.continuousVfx,
+                    data.effectScale
+                )
+            end
+
+            -- Call user hook
+            if MagExpPublicInterface and MagExpPublicInterface.onProjectilePierce then
+                pcall(function() MagExpPublicInterface.onProjectilePierce(data) end)
             end
         end,
 

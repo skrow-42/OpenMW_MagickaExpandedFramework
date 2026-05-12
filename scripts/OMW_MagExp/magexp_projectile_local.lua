@@ -1,5 +1,5 @@
 -- ============================================================
--- OMW_MagExp: Magic Expansion Framework for OpenMW
+-- Spell Framework Plus - skrow42
 -- magexp_projectile_local.lua (CUSTOM script - attached to projectile objects)
 --
 -- Handles per-frame physics, ray-cast collision detection, and
@@ -70,6 +70,13 @@ local bouncePower        = 0.7     -- restitution coeff: 1.0 = perfect elastic, 
 -- When false: actors are treated as static surface for bounce purposes.
 local detonateOnActorHit = true
 
+-- ---- Piercing system ----
+local piercing       = false  -- If true, projectile passes through actors
+local pierceLimit    = nil    -- Max actor pass-throughs before the next actor collision (nil = unlimited)
+local pierceCount    = 0      -- How many actors have been pierced so far
+local piercedActors  = {}     -- Set of actor object keys to prevent double-piercing
+local piercedActorObjects = {} -- Actor objects ignored by future raycasts for this projectile
+
 -- ---- Impact data ----
 local impactSpeed     = 0     -- speed captured the frame collision is confirmed (units/sec)
 local impactImpulse   = 0     -- MaxYari LuaPhysics impulse magnitude applied on detonation
@@ -127,6 +134,12 @@ local function onInit(data)
         bounceMax          = data.bounceMax          or 0
         bouncePower        = data.bouncePower        or 0.7
         detonateOnActorHit = (data.detonateOnActorHit ~= false)
+        -- Piercing
+        piercing           = data.piercing           or false
+        pierceLimit        = data.pierceLimit
+        pierceCount        = 0
+        piercedActors      = {}
+        piercedActorObjects = {}
         unreflectable      = data.unreflectable      or false
         casterLinked       = data.casterLinked       or false
         -- Impact
@@ -152,6 +165,7 @@ local function onInit(data)
         end
 
         if data.boltModel and data.boltModel ~= "" then
+            print("[MagExp] Adding VFX model:", data.boltModel)
             local opts = {
                 useAmbientLight = true,
                 loop            = true,
@@ -161,6 +175,9 @@ local function onInit(data)
                 opts.particleTextureOverride = data.particle
             end
             boltVfxHandle = anim.addVfx(self, data.boltModel, opts)
+            print("[MagExp] VFX handle:", boltVfxHandle and "SUCCESS" or "FAILED")
+        else
+            print("[MagExp] No boltModel provided!")
         end
 
         -- Request Sound Anchor creation on global side
@@ -273,24 +290,150 @@ local function onUpdate(dt)
     local lookAheadDist = moveDist * 2.0
     local ray           = nil
 
-    for _, offset in ipairs(offsets) do
-        local startPos = from + offset
-        local endPos   = startPos + dir * lookAheadDist
-        local hit      = nearby.castRay(startPos, endPos, { ignore = { self, attacker } })
-        if hit.hit then
-            local hitObj = hit.hitObject
-            -- Dead actor pass-through
-            if hitObj and hitObj:isValid()
-               and types.Actor.objectIsInstance(hitObj)
-               and types.Actor.isDead(hitObj) then
-                -- skip
-            else
-                ray = hit; break
+    local function isActorObject(obj)
+        return obj and obj:isValid() and types.Actor.objectIsInstance(obj)
+    end
+
+    local function isLiveActorObject(obj)
+        return isActorObject(obj) and not types.Actor.isDead(obj)
+    end
+
+    local function buildIgnoreList()
+        local ignore = { self }
+        if attacker then ignore[#ignore + 1] = attacker end
+        for _, actor in pairs(piercedActorObjects) do
+            if actor and actor:isValid() then
+                ignore[#ignore + 1] = actor
             end
+        end
+        return ignore
+    end
+
+    local function castFirstHit(segmentFrom, segmentDistance)
+        if segmentDistance <= 0 then return nil end
+        local ignore = buildIgnoreList()
+        for _, offset in ipairs(offsets) do
+            local startPos = segmentFrom + offset
+            local endPos   = startPos + dir * segmentDistance
+            local hit      = nearby.castRay(startPos, endPos, { ignore = ignore })
+            if hit.hit then
+                local hitObj = hit.hitObject
+                -- Dead actor pass-through
+                if isActorObject(hitObj) and types.Actor.isDead(hitObj) then
+                    -- skip
+                else
+                    return hit
+                end
+            end
+        end
+        return nil
+    end
+
+    local function sendPierceEvent(hitObj, hit)
+        core.sendGlobalEvent('MagExp_OnProjectilePierce', {
+            projectile    = self,
+            hitObject     = hitObj,
+            hitPos        = hit.hitPos,
+            hitNormal     = hit.hitNormal,
+            velocity      = velocity,
+            impactSpeed   = velocity:length(),
+            attacker      = attacker,
+            spellId       = spellId,
+            area          = area,
+            effectIndexes = effectIndexes,
+            soundAnchor   = soundAnchor,
+            lightAnchor   = lightAnchor,
+            vfxRecId      = vfxRecId,
+            areaVfxRecId  = areaVfxRecId,
+            impactImpulse = impactImpulse,
+            unreflectable = unreflectable,
+            casterLinked  = casterLinked,
+            userData      = userData,
+            muteAudio     = muteAudio,
+            muteLight     = muteLight,
+            continuousVfx = continuousVfx,
+            effectScale   = effectScale,
+            pierceCount   = pierceCount,
+            pierceLimit   = pierceLimit,
+            isPierce      = true
+        })
+    end
+
+    local function collideAfterPierceLimit(hitObj, hit)
+        impactSpeed = velocity:length()
+        hasCollided = true
+        stopSound()
+        core.sendGlobalEvent('MagExp_ProjectileCollision', {
+            projectile    = self,
+            hitObject     = hitObj,
+            hitPos        = hit.hitPos,
+            hitNormal     = hit.hitNormal,
+            velocity      = velocity,
+            impactSpeed   = impactSpeed,
+            attacker      = attacker,
+            spellId       = spellId,
+            area          = area,
+            effectIndexes = effectIndexes,
+            soundAnchor   = soundAnchor,
+            lightAnchor   = lightAnchor,
+            vfxRecId      = vfxRecId,
+            areaVfxRecId  = areaVfxRecId,
+            impactImpulse = impactImpulse,
+            unreflectable = unreflectable,
+            casterLinked  = casterLinked,
+            userData      = userData,
+            muteAudio     = muteAudio,
+            muteLight     = muteLight,
+            continuousVfx = continuousVfx,
+            effectScale   = effectScale,
+            pierceCount   = pierceCount,
+            pierceLimit   = pierceLimit,
+            isPierce      = false
+        })
+    end
+
+    local segmentFrom = from
+    local segmentDistance = lookAheadDist
+    local maxPierceChecks = 1
+    if piercing then
+        maxPierceChecks = math.min((tonumber(pierceLimit) or 8) + 1, 16)
+    end
+
+    for _ = 1, maxPierceChecks do
+        ray = castFirstHit(segmentFrom, segmentDistance)
+        if not ray then break end
+
+        local hitObj = ray.hitObject
+        if piercing and isLiveActorObject(hitObj) then
+            local actorKey = tostring(hitObj)
+            if not piercedActors[actorKey] then
+                -- pierceLimit is a pass-through budget: Pierce 3 ignores
+                -- actors 1-3, then actor 4 collides through the normal path.
+                if pierceLimit and pierceCount >= pierceLimit then
+                    collideAfterPierceLimit(hitObj, ray)
+                    return
+                end
+
+                piercedActors[actorKey] = true
+                piercedActorObjects[actorKey] = hitObj
+                pierceCount = pierceCount + 1
+                sendPierceEvent(hitObj, ray)
+            else
+                piercedActorObjects[actorKey] = hitObj
+            end
+
+            -- Treat the pierced actor as non-blocking and keep checking the
+            -- remaining segment so walls/statics behind the actor still collide.
+            segmentFrom = ray.hitPos + dir * 1
+            segmentDistance = lookAheadDist - (segmentFrom - from):length()
+            ray = nil
+            if segmentDistance <= 0 then break end
+        else
+            break
         end
     end
 
-    -- ---- Collision / Bounce decision ----
+    -- ---- Collision / Bounce / Piercing decision ----
     if ray then
         local hitObj  = ray.hitObject
         local isActor = hitObj and hitObj:isValid()
@@ -299,7 +442,7 @@ local function onUpdate(dt)
 
         local bounceLimitReached = (bounceMax > 0 and bounceCount >= bounceMax)
 
-        -- Determine whether to detonate or bounce
+        -- Determine whether to detonate or bounce (non-piercing path)
         local shouldDetonate = true
         if bounceEnabled then
             if isActor then
@@ -427,6 +570,8 @@ return {
             if data.bounceMax          ~= nil then bounceMax          = data.bounceMax end
             if data.bouncePower        ~= nil then bouncePower        = data.bouncePower end
             if data.detonateOnActorHit ~= nil then detonateOnActorHit = data.detonateOnActorHit end
+            if data.piercing           ~= nil then piercing           = data.piercing end
+            if data.pierceLimit        ~= nil then pierceLimit        = data.pierceLimit end
             if data.spellId            ~= nil then spellId            = data.spellId end
             if data.area               ~= nil then area               = data.area end
             if data.areaVfxRecId       ~= nil then areaVfxRecId       = data.areaVfxRecId end
@@ -484,6 +629,9 @@ return {
                 bounceMax          = bounceMax,
                 bouncePower        = bouncePower,
                 detonateOnActorHit = detonateOnActorHit,
+                piercing           = piercing,
+                pierceLimit        = pierceLimit,
+                pierceCount        = pierceCount,
                 hasCollided        = hasCollided,
                 vfxRecId           = vfxRecId,
                 areaVfxRecId       = areaVfxRecId,
