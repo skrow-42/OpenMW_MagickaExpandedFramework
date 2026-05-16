@@ -1159,12 +1159,42 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                     debugLog("[DETONATE] ERROR: Missing or invalid model for static ID: " .. tostring(areaStaticId))
                 end
             end
-            if explosionSound and not muteAudio then
-                pcall(function() core.sound.playSound3d(explosionSound, caster, { position = pos, volume = 1.0 }) end)
+-- ✅ FIXED — replaces the broken playSound3d call at line 1163
+if explosionSound and not muteAudio then
+    local soundAnchor = nil
+
+    -- Search cell for the closest valid object to the blast position
+    if cell then
+        local bestDist = math.huge
+        for _, obj in ipairs(cell:getAll()) do
+            if obj:isValid() and obj.enabled then
+                local ok, d = pcall(function()
+                    return (obj.position - pos):length()
+                end)
+                if ok and d and d < bestDist then
+                    bestDist = d
+                    soundAnchor = obj
+                end
             end
         end
     end
 
+    -- Last resort: caster (only if valid — avoids the nil crash)
+    if not soundAnchor and caster and caster:isValid() then
+        soundAnchor = caster
+    end
+
+    if soundAnchor then
+        pcall(function()
+            core.sound.playSound3d(explosionSound, soundAnchor, { volume = 1.0 })
+        end)
+    else
+        debugLog("[DETONATE] No valid sound anchor found for: " .. tostring(explosionSound))
+    end
+end
+        
+    end
+end
     local isLockUnlock = false
     if spell.effects then
         for _, eff in ipairs(spell.effects) do
@@ -1235,6 +1265,8 @@ local function autoDetectProjectileParams(spell, primaryEffectIndex)
         areaVfxRecId = "",
         particleTex = "",
         boltSound   = nil,
+        hitSound    = nil,
+        castSound   = nil,
         boltLightId = nil,
         spinSpeed   = 0,
     }
@@ -1324,6 +1356,38 @@ local function autoDetectProjectileParams(spell, primaryEffectIndex)
         elseif s == "conjuration" then out.boltSound = "conjuration bolt"
         elseif s == "illusion"    then out.boltSound = "illusion bolt"
         else out.boltSound = "mysticism bolt" end
+    end
+
+    -- ---- Hit sound ----
+    if mgef and mgef.hitSound and mgef.hitSound ~= "" then
+        out.hitSound = mgef.hitSound
+    else
+        local s = (type(school) == "string") and school:lower() or "destruction"
+        if     s == "destruction" then
+            if n:find("frost") then out.hitSound = "frost hit"
+            elseif n:find("shock") or n:find("lightning") then out.hitSound = "shock hit"
+            else out.hitSound = "destruction hit" end
+        elseif s == "restoration" then out.hitSound = "restoration hit"
+        elseif s == "alteration"  then out.hitSound = "alteration hit"
+        elseif s == "conjuration" then out.hitSound = "conjuration hit"
+        elseif s == "illusion"    then out.hitSound = "illusion hit"
+        else out.hitSound = "mysticism hit" end
+    end
+
+    -- ---- Cast sound ----
+    if mgef and mgef.castSound and mgef.castSound ~= "" then
+        out.castSound = mgef.castSound
+    else
+        local s = (type(school) == "string") and school:lower() or "destruction"
+        if     s == "destruction" then
+            if n:find("frost") then out.castSound = "frost cast"
+            elseif n:find("shock") or n:find("lightning") then out.castSound = "shock cast"
+            else out.castSound = "destruction cast" end
+        elseif s == "restoration" then out.castSound = "restoration cast"
+        elseif s == "alteration"  then out.castSound = "alteration cast"
+        elseif s == "conjuration" then out.castSound = "conjuration cast"
+        elseif s == "illusion"    then out.castSound = "illusion cast"
+        else out.castSound = "mysticism cast" end
     end
 
     -- ---- Bolt light ----
@@ -1845,6 +1909,8 @@ local function launchSpell(data)
     local hitModel    = data.hitModel    or auto.hitModel
     local particleTex = data.particleTex or auto.particleTex
     local boltSound   = (data.muteAudio) and nil or (data.boltSound   or auto.boltSound)
+    local hitSound    = (data.muteAudio) and nil or (data.hitSound    or auto.hitSound)
+    local castSound   = (data.muteAudio) and nil or (data.castSound   or auto.castSound)
     -- [FEATURE 2] Light: prefer explicit override, then auto color draft, then nil
     local boltLightId = (data.muteLight) and nil or (data.boltLightId or auto.boltLightDraft)
     local spinSpeed   = (data.spinSpeed ~= nil) and data.spinSpeed or auto.spinSpeed
@@ -1883,10 +1949,10 @@ local function launchSpell(data)
 
     -- [FEATURE 2] Cast glow: spawn school-specific cast VFX on caster, mirroring C++ addSpellCastGlow.
     -- Duration is ~1.5s (the VFX animation's natural length), matching the engine constant.
-    if castModel ~= "" and not data.muteCastGlow then
-        pcall(function()
-            world.vfx.spawn(castModel, attacker.position, { attachToObject = attacker, mwMagicVfx = false })
-        end)
+    if castModel ~= "" and not data.muteCastGlow and #targetIndexes == 0 then
+    pcall(function()
+        world.vfx.spawn(castModel, attacker.position, { attachToObject = attacker, mwMagicVfx = false })
+    end)
     end
 
     print("[MagExp] Attempting to create projectile with recordId:", recordId)
@@ -1943,6 +2009,8 @@ local function launchSpell(data)
         area        = area,
         -- Audio
         boltSound   = boltSound,
+        hitSound    = hitSound,
+        castSound   = castSound,
         -- Lighting
         boltLightId = boltLightId,
         -- VFX
@@ -1969,6 +2037,7 @@ local function launchSpell(data)
         piercing      = data.piercing,
         pierceLimit   = data.pierceLimit,
         impactImpulse = data.impactImpulse,
+        anchorRecordId = data.anchorRecordId,
     }
     if proj and proj:isValid() then
         proj:sendEvent('MagExp_InitProjectile', initPayload)

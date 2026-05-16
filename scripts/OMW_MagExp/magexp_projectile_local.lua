@@ -40,7 +40,7 @@ local muteAudio       = false
 local muteLight       = false
 local continuousVfx   = false
 local effectScale     = nil
-
+local anchorRecordId = "Colony_Assassin_act" -- default fallback
 -- ---- Physics extensions ----
 -- accelerationExp: exponential signed speed multiplier per frame.
 -- When signedSpeed crosses zero the spell reverses direction.
@@ -149,6 +149,7 @@ local function onInit(data)
         muteLight     = data.muteLight     or false
         continuousVfx = data.continuousVfx or false
         effectScale   = data.effectScale
+        anchorRecordId = data.anchorRecordId or anchorRecordId
 
         if spinSpeed > 0 then isRotating = true end
 
@@ -182,11 +183,7 @@ local function onInit(data)
 
         -- Request Sound Anchor creation on global side
         if boltSound and boltSound ~= "" then
-            core.sendGlobalEvent('MagExp_CreateSoundAnchor', {
-                recordId   = "Colony_Assassin_act",
-                sound      = boltSound,
-                projectile = self
-            })
+            core.sendGlobalEvent('MagExp_CreateSoundAnchor', { recordId = anchorRecordId, sound = boltSound, projectile = self })
             boltSound = nil
         end
 
@@ -207,7 +204,7 @@ local function onInit(data)
         end
     end
 end
-
+        
 -- ============================================================
 -- [PER FRAME] Physics update
 -- ============================================================
