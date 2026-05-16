@@ -207,6 +207,10 @@ local function calcSpellBaseSuccessChance(spell, actor)
 end
 
 local function getSpellSuccessChance(spell, actor, isGodMode)
+    if spell.alwaysSucceedFlag then
+        return 100
+    end
+    
     if isGodMode then return 100 end
     if types.Actor.getEffect(actor, "silence") > 0 then return 0 end
     local soundLevel = types.Actor.getEffect(actor, "sound")
