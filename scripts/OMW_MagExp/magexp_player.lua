@@ -14,7 +14,7 @@ local camera  = require('openmw.camera')
 local util    = require('openmw.util')
 local debug   = require('openmw.debug')
 local I       = require('openmw.interfaces')
-
+local nearby = require('openmw.nearby')
 -- ---- State Management ----
 local busyUntil        = 0
 local hasQueuedLaunch  = false
@@ -48,6 +48,10 @@ end
 -- ============================================================
 -- [HELPERS] Launch Parameter Calculation
 -- ============================================================
+
+
+local nearby = require('openmw.nearby')
+
 local function calculateLaunchPayload(spell, item)
     local cameraMode = camera.getMode()
     local startPos, direction
@@ -62,13 +66,53 @@ local function calculateLaunchPayload(spell, item)
         startPos = startPos + camera.getLeft() * 25
     end
 
+    print("[MagExp-Player] Starting raycast from: " .. tostring(startPos))
+    print("[MagExp-Player] Direction: " .. tostring(direction))
+
+    local hitObject = nil
+    local hitPos = nil
+    
+    local rayOk, rayErr = pcall(function()
+        local endPos = startPos + direction * 300
+        print("[MagExp-Player] Ray end position: " .. tostring(endPos))
+        
+        local rayResult = nearby.castRay(startPos, endPos, {
+            ignore = self,
+        })
+        
+        print("[MagExp-Player] Raycast result: " .. tostring(rayResult))
+        
+        if rayResult then
+            print("[MagExp-Player] Ray hit something!")
+            print("[MagExp-Player] hitObject: " .. tostring(rayResult.hitObject))
+            print("[MagExp-Player] hitPos: " .. tostring(rayResult.hitPos))
+            
+            if rayResult.hitObject then
+                hitObject = rayResult.hitObject
+                hitPos = rayResult.hitPos
+                print("[MagExp-Player] Hit object type: " .. tostring(hitObject.type))
+                print("[MagExp-Player] Hit object recordId: " .. tostring(hitObject.recordId))
+            end
+        else
+            print("[MagExp-Player] Raycast returned nil")
+        end
+    end)
+    
+    if not rayOk then
+        print("[MagExp-Player] Raycast ERROR: " .. tostring(rayErr))
+    end
+    
+    print("[MagExp-Player] Final hitObject for payload: " .. tostring(hitObject))
+
     return {
         attacker   = self,
         spellId    = spell.id,
         itemObject = item,
         startPos   = startPos,
         direction  = direction,
-        isGodMode  = debug.isGodMode()
+        isGodMode  = debug.isGodMode(),
+        hitObject  = hitObject,
+        hitPos     = hitPos,
     }
 end
 

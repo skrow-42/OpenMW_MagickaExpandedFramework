@@ -37,7 +37,14 @@ local chargeKeyRegistry = {}
 --- [proj.id] = { projectile, spellId, attacker, launchTime, maxSpeed }
 --- Populated by launchSpell, removed on collision or expiry.
 local activeSpellRegistry = {}
-
+local OFFENSE_TYPE_IDS = types.OFFENSE_TYPE_IDS or {
+    Theft               = 0,
+    Assault             = 1,
+    Murder              = 2,
+    Trespassing         = 3,
+    SleepingInOwnedBed  = 4,
+    Pickpocket          = 5,
+}
 --- Internal unified target validator.
 --- Checks for basic validity (exists, is not a corpse) and then runs all registered custom filters.
 local function checkTarget(target)
@@ -978,54 +985,148 @@ end
 -- [UTILITY] Door lock/unlock handling
 -- ============================================================
 local function handleDoorLockUnlock(spellId, caster, target)
+    debugLog(string.format("[DOOR] handleDoorLockUnlock called: spellId=%s caster=%s target=%s",
+        tostring(spellId),
+        tostring(caster and caster.recordId or "nil"),
+        tostring(target and target.recordId or "nil")))
+
     local isLockable = (target and (target.type == types.Door or target.type == types.Container))
-    if not isLockable then return false end
-    
+    if not isLockable then
+        debugLog("[DOOR] Target is not lockable, returning false")
+        return false
+    end
+
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
-    if not spell or not spell.effects then return false end
+    if not spell or not spell.effects then
+        debugLog("[DOOR] Spell record not found or has no effects")
+        return false
+    end
+
+    -- Only prevents multiple crimes within a single spell's effect loop
+    -- Resets to false on every new call (every new cast)
+    local crimeCommitted = false
 
     for _, eff in ipairs(spell.effects) do
         local eid = tostring(eff.id):lower()
+
         if eid == "open" or eid == "lock" then
             local magnitude = math.random(eff.magnitudeMin or 0, eff.magnitudeMax or eff.magnitudeMin or 0)
-            -- print(string.format("[MagExp] Interaction: EID=%s, Mag=%d", eid, magnitude))
+            debugLog(string.format("[DOOR] Effect: %s magnitude: %d", eid, magnitude))
+
             if types.Lockable then
                 local isLocked = types.Lockable.isLocked(target)
                 local lockLvl = 0
-                if types.Lockable.getLockLevel then lockLvl = types.Lockable.getLockLevel(target)
-                elseif types.Lockable.lockLevel then lockLvl = types.Lockable.lockLevel(target) end
-                -- print(string.format("[MagExp] Target: %s, Locked: %s, LockLvl: %d", target.recordId, tostring(isLocked), lockLvl))
+                if types.Lockable.getLockLevel then
+                    lockLvl = types.Lockable.getLockLevel(target)
+                elseif types.Lockable.lockLevel then
+                    lockLvl = types.Lockable.lockLevel(target)
+                end
+                debugLog(string.format("[DOOR] isLocked=%s lockLevel=%d", tostring(isLocked), lockLvl))
 
                 if target.enabled then
                     if eid == "open" then
                         if isLocked and magnitude >= lockLvl then
+                            debugLog("[DOOR] Unlocking target")
                             types.Lockable.unlock(target)
-                            pcall(function() core.sound.playSound3d("Open Lock", target) end)
-                            pcall(function() core.sound.playSound3d("alteration hit", target) end)
+                            core.sound.playSound3d("Open Lock", target)
                         elseif isLocked then
-                            pcall(function() core.sound.playSound3d("Open Lock Fail", target) end)
-                            pcall(function() core.sound.playSound3d("alteration hit", target) end)
+                            debugLog("[DOOR] Failed to unlock (magnitude too low)")
+                            core.sound.playSound3d("Open Lock Fail", target)
+                        else
+                            debugLog("[DOOR] Target already unlocked — still applying crime + VFX per vanilla")
                         end
                     elseif eid == "lock" then
                         if not isLocked or magnitude > lockLvl then
+                            debugLog("[DOOR] Locking target")
                             types.Lockable.lock(target, magnitude)
-                            pcall(function() core.sound.playSound3d("Open Lock", target) end)
-                            pcall(function() core.sound.playSound3d("alteration hit", target) end)
+                            core.sound.playSound3d("Open Lock", target)
+                        else
+                            debugLog("[DOOR] Already locked with equal or higher level")
                         end
                     end
                 end
 
-                local rid = "vfx_alteration_hit"
+                -- [VFX] Always fire alteration hit on every cast, regardless of lock state
+                local vfxPos, _ = getObjectCenter(target)
+                vfxPos = vfxPos or target.position
+                local rid = "VFX_AlterationHit"
                 local staticRecord = types.Static.records[rid] or types.Weapon.records[rid]
                 if staticRecord and staticRecord.model then
-                    world.vfx.spawn(staticRecord.model, target.position, { mwMagicVfx = false })
+                    core.sound.playSound3d("alteration hit", target)
+                    world.vfx.spawn(staticRecord.model, vfxPos, { mwMagicVfx = false })
+                    debugLog("[DOOR] Spawned Alteration Hit VFX")
+                else
+                    debugLog("[DOOR] WARNING: vfx_alteration_hit record or model not found")
+                end
+
+                -- [CRIME] Always fire on owned objects, every cast, only once per spell cast
+                if caster and caster.type == types.Player and not crimeCommitted then
+                    local Crimes = I.Crimes
+                    if not Crimes then
+                        debugLog("[DOOR] ERROR: Crimes interface not available")
+                    else
+                        local victim, factionId = nil, nil
+                        local owner = target.owner
+
+                        if owner then
+                            factionId = owner.factionId
+                            local ownerRecordId = owner.recordId
+
+                            debugLog(string.format("[DOOR] owner.recordId=%s owner.factionId=%s",
+                                tostring(ownerRecordId), tostring(factionId)))
+
+                            if ownerRecordId and ownerRecordId ~= "" and target.cell then
+                                for _, obj in ipairs(target.cell:getAll()) do
+                                    if obj:isValid() and obj.type == types.NPC and obj.recordId == ownerRecordId then
+                                        victim = obj
+                                        debugLog("[DOOR] Found victim NPC: " .. tostring(victim.recordId))
+                                        break
+                                    end
+                                end
+                            end
+
+                            if victim and (not factionId or factionId == "") then
+                                local npcRecord = types.NPC.records[victim.recordId]
+                                if npcRecord and npcRecord.faction and npcRecord.faction ~= "" then
+                                    factionId = npcRecord.faction
+                                    debugLog("[DOOR] Using NPC record faction: " .. factionId)
+                                end
+                            end
+                        else
+                            debugLog("[DOOR] Target has no owner — no crime")
+                        end
+
+                        if victim or (factionId and factionId ~= "") then
+                            debugLog(string.format("[DOOR] Committing crime: victim=%s faction=%s",
+                                tostring(victim and victim.recordId or "nil"),
+                                tostring(factionId or "nil")))
+
+                            local result = Crimes.commitCrime(caster, {
+                                type        = OFFENSE_TYPE_IDS.Trespassing,
+                                victim      = victim,
+                                faction     = factionId,
+                                victimAware = false,
+                            })
+
+                            debugLog(string.format("[DOOR] Crime result: wasCrimeSeen=%s",
+                                tostring(result and result.wasCrimeSeen or "nil")))
+
+                            -- Prevent multiple crimes within this single spell's effect loop only
+                            if result and result.wasCrimeSeen then
+                                crimeCommitted = true
+                                debugLog("[DOOR] Crime seen — blocking further crime calls within this cast")
+                            end
+                        else
+                            debugLog("[DOOR] No owner found — skipping crime")
+                        end
+                    end
                 end
             end
         end
     end
+
     return true
 end
-
 -- ============================================================
 -- [AOE] Detonate spell at world position
 -- ============================================================
@@ -1809,75 +1910,95 @@ local function launchSpell(data)
     end
 
     -- ---- TOUCH ---- (only indexes in touchIndexes; Target effects are handled by projectile below)
-    if #touchIndexes > 0 then
-        local obj = data.hitObject
-        if obj and obj:isValid() then
-            local spellIsLockUnlock, spellIsUniversal = spellFlagsFromEffectIndexes(touchIndexes)
+if #touchIndexes > 0 then
+    debugLog(string.format("[TOUCH] Touch spell detected with %d effects", #touchIndexes))
+    local obj = data.hitObject
+    debugLog(string.format("[TOUCH] data.hitObject = %s", tostring(obj)))
+    
+    if obj and obj:isValid() then
+        debugLog(string.format("[TOUCH] Hit object is VALID: type=%s recordId=%s", tostring(obj.type), tostring(obj.recordId)))
+        
+        local spellIsLockUnlock, spellIsUniversal = spellFlagsFromEffectIndexes(touchIndexes)
+        debugLog(string.format("[TOUCH] spellIsLockUnlock=%s spellIsUniversal=%s", tostring(spellIsLockUnlock), tostring(spellIsUniversal)))
 
-            local isLockable = (obj.type == types.Door or obj.type == types.Container)
-            local isActor    = (obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player)
+        local isLockable = (obj.type == types.Door or obj.type == types.Container)
+        local isActor    = (obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player)
+        debugLog(string.format("[TOUCH] isLockable=%s isActor=%s", tostring(isLockable), tostring(isActor)))
 
-            local validTarget = (isLockable or isActor or spellIsUniversal)
+        local validTarget = (isLockable or isActor or spellIsUniversal)
+        debugLog(string.format("[TOUCH] validTarget=%s", tostring(validTarget)))
 
-            if validTarget then
-                local hitPos = getObjectCenter(obj) or obj.position
-                if isActor then
-                    local zOffset = 95
-                    pcall(function()
-                        local bbox = obj:getBoundingBox()
-                        if bbox then
-                            zOffset = bbox.halfSize.z
-                            if zOffset > 105 then zOffset = 100 end
-                        end
-                    end)
-                    hitPos = obj.position + util.vector3(0, 0, zOffset)
-                end
-
-                local touchArea = maxAreaAmongIndexes(spell, touchIndexes)
-                if effectScale < 1 then
-                    touchArea = math.max(0, math.floor(touchArea * effectScale + 0.5))
-                end
-
-                if spellIsLockUnlock then
-                    handleDoorLockUnlock(spellId, attacker, obj)
-                elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
-                    if touchArea > 0 then
-                        detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+        if validTarget then
+            debugLog("[TOUCH] Valid target confirmed, proceeding with interaction")
+            local hitPos = getObjectCenter(obj) or obj.position
+            if isActor then
+                local zOffset = 95
+                pcall(function()
+                    local bbox = obj:getBoundingBox()
+                    if bbox then
+                        zOffset = bbox.halfSize.z
+                        if zOffset > 105 then zOffset = 100 end
                     end
-                    applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, touchIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
-                end
-
-                local isProperTarget = spellIsUniversal or (spellIsLockUnlock and isLockable)
-                    or (not spellIsLockUnlock and isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)))
-
-                if isProperTarget then
-                    fireMagicHitEvent({
-                        attacker   = attacker,
-                        target     = obj,
-                        spellId    = spellId,
-                        itemObject = itemObject,
-                        hitPos     = hitPos,
-                        isAoE      = false,
-                        area       = touchArea,
-                        spellType  = core.magic.RANGE.Touch,
-                        effectIndex = touchIndexes[1],
-                        unreflectable = data.unreflectable,
-                        casterLinked = data.casterLinked,
-                        userData   = data.userData
-                    })
-                end
+                end)
+                hitPos = obj.position + util.vector3(0, 0, zOffset)
             end
-        end
 
-        -- Pure Touch spell with no projectile leg: behavior matches vanilla (need valid touch when no Target effects).
-        if #targetIndexes == 0 then
-            return
+            local touchArea = maxAreaAmongIndexes(spell, touchIndexes)
+            if effectScale < 1 then
+                touchArea = math.max(0, math.floor(touchArea * effectScale + 0.5))
+            end
+
+            if spellIsLockUnlock then
+                debugLog("[TOUCH] Calling handleDoorLockUnlock for: " .. tostring(obj.recordId))
+                handleDoorLockUnlock(spellId, attacker, obj)
+            elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
+                debugLog("[TOUCH] Applying spell to actor: " .. tostring(obj.recordId))
+                if touchArea > 0 then
+                    detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+                end
+                applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, touchIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
+            else
+                debugLog("[TOUCH] WARNING: validTarget=true but no action taken (not lockable, not actor)")
+            end
+
+            local isProperTarget = spellIsUniversal or (spellIsLockUnlock and isLockable)
+                or (not spellIsLockUnlock and isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)))
+
+            if isProperTarget then
+                debugLog("[TOUCH] Firing MagicHit event")
+                fireMagicHitEvent({
+                    attacker   = attacker,
+                    target     = obj,
+                    spellId    = spellId,
+                    itemObject = itemObject,
+                    hitPos     = hitPos,
+                    isAoE      = false,
+                    area       = touchArea,
+                    spellType  = core.magic.RANGE.Touch,
+                    effectIndex = touchIndexes[1],
+                    unreflectable = data.unreflectable,
+                    casterLinked = data.casterLinked,
+                    userData   = data.userData
+                })
+            end
+        else
+            debugLog("[TOUCH] WARNING: Hit object is not a validTarget")
         end
+    else
+        debugLog("[TOUCH] WARNING: data.hitObject is nil or invalid — Touch spell has no target!")
     end
 
+    -- Pure Touch spell with no projectile leg: behavior matches vanilla (need valid touch when no Target effects).
     if #targetIndexes == 0 then
+        debugLog("[TOUCH] Pure Touch spell (no Target effects), returning")
         return
     end
+end
+
+if #targetIndexes == 0 then
+    debugLog("[TOUCH] No Target effects remaining, returning")
+    return
+end
 
     -- ---- TARGET (projectile): only Target-range effect indices ----
     local area = data.area
