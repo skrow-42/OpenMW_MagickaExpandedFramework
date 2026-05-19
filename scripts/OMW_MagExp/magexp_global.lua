@@ -834,54 +834,41 @@ end
             debugLog(string.format("Successfully added %s (%d effect(s))", spellId, effCount))
 
             local scale = coerceEffectScale(effectScale)
-            if scale < 1 and scale > 0 and spell.effects and effectIndexes then
-                local targetRef = target
-                local spellRef = spell
-                local idxList = effectIndexes
-                local scaleRef = scale
-                async:newUnsavableSimulationTimer(0, function()
-                    if not targetRef or not targetRef:isValid() then return end
-                    local ae = types.Actor.activeEffects(targetRef)
-                    if not ae then return end
-                    for _, idx in ipairs(idxList) do
-                        local rawEff = spellRef.effects[idx + 1]
-                        if rawEff then
-                            local candidates = magicEffectIdCandidates(rawEff)
-                            local extra = magicEffectExtraParam(rawEff)
-                            if #candidates == 0 then
-                                debugLog("effect scale: no effect id candidates for spell index " .. tostring(idx))
-                            else
-                                local avgMag = ((rawEff.magnitudeMin or 0) + (rawEff.magnitudeMax or rawEff.magnitudeMin or 0)) * 0.5
-                                local reduceBy = avgMag * (1 - scaleRef)
-                                if reduceBy > 0 then
-                                    local useId = pickEffectIdForModify(ae, candidates, extra)
-                                    if useId then
-                                        pcall(function() ae:modify(-reduceBy, useId, extra) end)
-                                    end
-                                end
-                                local rawDuration = rawEff.duration or 0
-                                if rawDuration > 0 then
-                                    local scaledDuration = math.max(1, math.floor((rawDuration * scaleRef) + 0.5))
-                                    if scaledDuration < rawDuration and avgMag > 0 then
-                                        local scaledMagnitude = avgMag * scaleRef
-                                        local useId = pickEffectIdForModify(ae, candidates, extra)
-                                        local tr = targetRef
-                                        local ex = extra
-                                        async:newUnsavableSimulationTimer(scaledDuration, function()
-                                            if tr and tr:isValid() and useId then
-                                                local ae2 = types.Actor.activeEffects(tr)
-                                                if ae2 then
-                                                    pcall(function() ae2:modify(-scaledMagnitude, useId, ex) end)
-                                                end
-                                            end
-                                        end)
-                                    end
-                                end
+    if scale < 1 and scale > 0 and spell.effects and effectIndexes then
+    -- Only apply ae:modify for INSTANT effects (duration == 0)
+    -- Duration effects MUST NOT use ae:modify — it causes permanent stat corruption
+    -- on spell expiry because the engine removes the spell contribution independently.
+    async:newUnsavableSimulationTimer(0, function()
+        if not target or not target:isValid() then return end
+        local ae = types.Actor.activeEffects(target)
+        if not ae then return end
+        for _, idx in ipairs(effectIndexes) do
+            local rawEff = spell.effects[idx + 1]
+            if rawEff then
+                local rawDuration = rawEff.duration or 0
+                -- Skip ALL duration-based effects — engine handles their cleanup
+                if rawDuration > 0 then
+                    debugLog("effect scale: skipping duration effect (would corrupt stats): " .. tostring(rawEff.id))
+                else
+                    -- Instant effect: safe to scale via ae:modify because
+                    -- there is no spell expiry event that will reverse it
+                    local candidates = magicEffectIdCandidates(rawEff)
+                    local extra = magicEffectExtraParam(rawEff)
+                    if #candidates > 0 then
+                        local avgMag = ((rawEff.magnitudeMin or 0) + (rawEff.magnitudeMax or rawEff.magnitudeMin or 0)) * 0.5
+                        local reduceBy = avgMag * (1 - scale)
+                        if reduceBy > 0 then
+                            local useId = pickEffectIdForModify(ae, candidates, extra)
+                            if useId then
+                                pcall(function() ae:modify(-reduceBy, useId, extra) end)
                             end
                         end
                     end
-                end)
+                end
             end
+        end
+    end)
+    end
 
             if not trackedEffectRegistry[target] then trackedEffectRegistry[target] = {} end
             local trackingData = {
@@ -2699,30 +2686,33 @@ return {
         end,
 
         MagExp_ProcessCast = function(data)
-            local actor = data.actor
-            if not actor or not actor:isValid() then return end
-            local spell = core.magic.spells.records[data.spellId] or core.magic.enchantments.records[data.spellId]
-            if not spell then return end
-            
-            local chance = getSpellSuccessChance(spell, actor, data.isGodMode)
-            local roll = math.random(0, 99)
-            if roll < chance then
-                actor:sendEvent('MagExp_CastResult', {
-                    spellId = data.spellId,
-                    success = true,
-                    item    = data.item,
-                    isFree  = data.isFree
-                })
-            else
-                actor:sendEvent('MagExp_CastResult', {
-                    spellId = data.spellId,
-                    success = false
-                })
-                if actor.enabled then
-                    pcall(function() core.sound.playSound3d("spell failure destruction", actor) end)
-                end
-            end
-        end,
+    local actor = data.actor
+    if not actor or not actor:isValid() then return end
+    local spell = core.magic.spells.records[data.spellId] or core.magic.enchantments.records[data.spellId]
+    if not spell then return end
+    
+    -- NEW: Treat 100% calculated chance the same as alwaysSucceedFlag
+    -- Resolves BEFORE the random roll so the animation commits immediately
+    local chance = getSpellSuccessChance(spell, actor, data.isGodMode)
+    local success = (chance >= 100) or (math.random(0, 99) < chance)
+    
+    if success then
+        actor:sendEvent('MagExp_CastResult', {
+            spellId = data.spellId,
+            success = true,
+            item    = data.item,
+            isFree  = data.isFree
+        })
+    else
+        actor:sendEvent('MagExp_CastResult', {
+            spellId = data.spellId,
+            success = false
+        })
+        if actor.enabled then
+            pcall(function() core.sound.playSound3d("spell failure destruction", actor) end)
+        end
+    end
+    end,
 
         --- Internal: Sync physics updates from local to global registry
         MagExp_UpdateRegistry = function(data)
