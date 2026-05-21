@@ -477,41 +477,62 @@ end
 -- ============================================================
 
 --- Fallback hit static record id when mgef.hitVfx is absent (ported from legacy manual apply VFX resolver).
-local function deriveMagicEffectImpactStaticId(mgef)
+local function deriveMagicEffectImpactAreaId(mgef)
     if not mgef then return nil end
-    if mgef.hitVfx and mgef.hitVfx ~= "" then return mgef.hitVfx end
+    
     local schoolIdx = mgef.school
     local s = "destruction"
-    if type(schoolIdx) == "string" then s = schoolIdx:lower()
+    if type(schoolIdx) == "string" then 
+        s = schoolIdx:lower()
     elseif type(schoolIdx) == "number" then
-        local schools = { [0] = "alteration", [1] = "conjuration", [2] = "destruction", [3] = "illusion", [4] = "mysticism", [5] = "restoration" }
+        local schools = { 
+            [0] = "alteration", 
+            [1] = "conjuration", 
+            [2] = "destruction", 
+            [3] = "illusion", 
+            [4] = "mysticism", 
+            [5] = "restoration" 
+        }
         s = schools[schoolIdx] or "destruction"
     end
 
     local n = (mgef.name or ""):lower()
     local eid = tostring(mgef.id):lower()
     local element = nil
-    if n:find("fire") or eid:find("fire") then element = "Fire"
-    elseif n:find("frost") or eid:find("frost") or n:find("cold") or eid:find("cold") then element = "Frost"
-    elseif n:find("shock") or eid:find("shock") or n:find("lightn") then element = "Lightning"
-    elseif n:find("poison") or eid:find("poison") then element = "Poison"
+    if n:find("fire") or eid:find("fire") then 
+        element = "Fire"
+    elseif n:find("frost") or eid:find("frost") or n:find("cold") or eid:find("cold") then 
+        element = "Frost"
+    elseif n:find("shock") or eid:find("shock") or n:find("lightn") then 
+        element = "Lightning"
+    elseif n:find("poison") or eid:find("poison") then 
+        element = "Poison"
     end
 
-    local hitVfxId
-    if element then hitVfxId = "VFX_" .. element .. "Hit"
-    elseif s == "destruction" then hitVfxId = "VFX_DestructHit"
-    elseif s == "alteration" then hitVfxId = "VFX_AlterationHit"
-    elseif s == "conjuration" then hitVfxId = "VFX_ConjureHit"
-    elseif s == "illusion" then hitVfxId = "VFX_IllusionHit"
-    elseif s == "mysticism" then hitVfxId = "VFX_MysticismHit"
-    elseif s == "restoration" then hitVfxId = "VFX_RestorationHit"
-    else hitVfxId = "VFX_DefaultHit" end
+    local areaVfxId
+    if element then 
+        areaVfxId = "VFX_" .. element .. "Area"
+    elseif s == "destruction" then 
+        areaVfxId = "VFX_DestructArea"
+    elseif s == "alteration" then 
+        areaVfxId = "VFX_AlterationArea"
+    elseif s == "conjuration" then 
+        areaVfxId = "VFX_ConjureArea"
+    elseif s == "illusion" then 
+        areaVfxId = "VFX_IllusionArea"
+    elseif s == "mysticism" then 
+        areaVfxId = "VFX_MysticismArea"
+    elseif s == "restoration" then 
+        areaVfxId = "VFX_RestorationArea"
+    else 
+        areaVfxId = "VFX_DefaultArea" 
+    end
 
-    local lId = tostring(hitVfxId):lower()
+    local lId = tostring(areaVfxId):lower()
     if not (types.Static.records[lId] or types.Weapon.records[lId]) then
-        if tostring(hitVfxId):find("Hit") then hitVfxId = "VFX_DefaultHit" end
+        areaVfxId = "VFX_DefaultArea"
     end
-    return hitVfxId
+    return areaVfxId
 end
 
 local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData)
@@ -733,7 +754,6 @@ end
                             if target:isValid() and target.enabled then
                                 opts.attachToObject = target
                             end
-                            world.vfx.spawn(rec.model, resolveSpawnPos(), opts)
                         end
                     end
                 end
@@ -979,6 +999,35 @@ local function dominantAreaEffectIndex(spell, idxList)
         if a > bestA then bestA = a; pick = ix end
     end
     return pick
+end
+
+--- Groups a list of 0-based effect indexes by their magic school.
+--- Returns an ordered list of { school = "...", mgef = <record or nil>, indexes = {0based...} }.
+--- Effects with no MagicEffect record fall into school="default".
+local function groupEffectIndexesBySchool(spell, idxList)
+    if not spell or not spell.effects or not idxList then return {} end
+
+    local groups = {}      -- ordered list
+    local groupMap = {}    -- schoolKey -> group entry
+
+    for _, idx in ipairs(idxList) do
+        local eff = spell.effects[idx + 1]
+        if eff then
+            local mgef = core.magic.effects.records[eff.id]
+            local schoolKey = (mgef and mgef.school) and tostring(mgef.school):lower() or "default"
+
+            local g = groupMap[schoolKey]
+            if not g then
+                g = { school = schoolKey, mgef = mgef, indexes = {} }
+                groupMap[schoolKey] = g
+                table.insert(groups, g)
+            end
+
+            table.insert(g.indexes, idx)
+        end
+    end
+
+    return groups
 end
 
 -- ============================================================
@@ -1585,6 +1634,196 @@ end
 --   projectileRecordId = "Colony_Assassin_act",  -- world object record used as the projectile carrier
 -- }
 -- ============================================================
+--- Returns a list of unique school IDs present across ALL effects of a spell.
+--- Each entry is { school = "alteration", mgef = <record> }
+--- Preserves insertion order (first occurrence of each school wins).
+local function collectSpellSchools(spell)
+    if not spell or not spell.effects then return {} end
+    local seen = {}
+    local out = {}
+    for _, eff in ipairs(spell.effects) do
+        local mgef = core.magic.effects.records[eff.id]
+        if mgef and mgef.school then
+            local s = tostring(mgef.school):lower()
+            if not seen[s] then
+                seen[s] = true
+                table.insert(out, { school = s, mgef = mgef })
+            end
+        end
+    end
+    return out
+end
+
+--- Resolve cast VFX model path with priority:
+--- 1. Explicit mgef.castVfx field
+--- 2. Elemental keywords (poison, shock, frost)
+--- 3. Generic school (alteration, destruction, etc.)
+--- 4. Final fallback (VFX_DefaultCast)
+--- Resolve cast VFX model path with strict priority.
+local function resolveCastVfxModel(mgef, school)
+    if not mgef then return nil end
+
+    -- Helper to find the first valid model from a list of record IDs.
+    local function findFirstValidVfxModel(candidates)
+        for _, rid in ipairs(candidates) do
+            local rec = types.Static.records[rid] or types.Static.records[rid:lower()]
+            if not rec then
+                rec = types.Weapon.records[rid] or types.Weapon.records[rid:lower()]
+            end
+            if rec and rec.model then
+                debugLog("[VFX RESOLVER] Found valid model for candidate: " .. rid)
+                return rec.model
+            end
+        end
+        return nil
+    end
+
+    -- Priority 1: Explicit mgef.castVfx field
+    if mgef.castVfx and mgef.castVfx ~= "" then
+        local model = findFirstValidVfxModel({mgef.castVfx})
+        if model then return model end
+    end
+
+    -- Priority 2: Elemental keywords
+    local n = mgef.name:lower()
+    local id = mgef.id:lower()
+    local elementalCandidates = {}
+    if n:find("poison") or id:find("poison") then
+        elementalCandidates = {"VFX_PoisonCast"}
+    elseif n:find("shock") or id:find("lightn") then
+        elementalCandidates = {"VFX_LightningCast", "VFX_LightningHit"}
+    elseif n:find("frost") or id:find("frost") then
+        elementalCandidates = {"VFX_FrostCast", "VFX_FrostHit"}
+    end
+    if #elementalCandidates > 0 then
+        local model = findFirstValidVfxModel(elementalCandidates)
+        if model then return model end -- IMPORTANT: Stops here if found
+    end
+
+    -- Priority 3: Generic school
+    local schoolCandidates = {
+        alteration  = {"VFX_AlterationCast", "VFX_AlterationHit"},
+        conjuration = {"VFX_ConjureCast"},
+        destruction = {"VFX_DestructCast"},
+        illusion    = {"VFX_IllusionCast"},
+        mysticism   = {"VFX_MysticismCast"},
+        restoration = {"VFX_RestorationCast"},
+    }
+    if schoolCandidates[school] then
+        local model = findFirstValidVfxModel(schoolCandidates[school])
+        if model then return model end
+    end
+
+    -- Priority 4: Final fallback
+    return findFirstValidVfxModel({"VFX_DefaultCast"})
+end
+
+--- Award spell school skill progress to the caster (player only).
+--- Global scripts cannot modify player stats directly — forward to player script.
+local function awardSpellSkillProgress(caster, school, spellCost)
+    if not caster or not caster:isValid() then return end
+    if caster.type ~= types.Player then return end
+    if not school or school == "" then return end
+
+    -- Vanilla-like formula: spell cost * 0.01 (adjustable via multiplier)
+    local progress = (spellCost or 0) * 0.0005
+    
+    debugLog(string.format("[SKILL] Requesting %.2f progress for %s (cost=%d)", 
+        progress, tostring(school), spellCost or 0))
+
+    caster:sendEvent('MagExp_AwardSkillProgress', {
+        school   = school,
+        progress = progress,
+    })
+end
+
+-- ============================================================
+-- [CAST VFX] Spawn cast-start VFX for *every* effect in the spell.
+-- This MUST live in launchSpell() path so mods like OSSC that call
+-- MagExp_CastRequest directly still get caster VFX.
+--
+-- Uses MagicEffect.castStatic (OpenMW field) to resolve the cast VFX. <!--citation:1-->
+-- Uses actor AddVfx -> animation.addVfx with boneName/vfxId. <!--citation:2-->
+-- ============================================================
+
+local function _magExpEffectElementKey(mgef, effIdFallback)
+    local name = (mgef and mgef.name or ""):lower()
+    local id   = (mgef and mgef.id   or effIdFallback or ""):lower()
+
+    if name:find("fire") or id:find("fire") then return "fire" end
+    if name:find("frost") or id:find("frost") or name:find("cold") or id:find("cold") then return "frost" end
+    if name:find("shock") or id:find("shock") or name:find("lightning") or id:find("lightning") then return "shock" end
+    if name:find("poison") or id:find("poison") then return "poison" end
+    return nil
+end
+
+local function _magExpResolveCastStaticId(mgef)
+    -- Primary: OpenMW MagicEffect.castStatic <!--citation:1-->
+    if mgef and mgef.castStatic and mgef.castStatic ~= "" then
+        return mgef.castStatic
+    end
+    return nil
+end
+
+local function _magExpFallbackCastStaticId(mgef, effIdFallback)
+    -- If an effect has no castStatic (or a modded effect is missing it),
+    -- fall back to element/school.
+    local element = _magExpEffectElementKey(mgef, effIdFallback)
+    local school  = tostring(mgef and mgef.school or "default"):lower()
+
+    local map = {
+        fire        = "VFX_DefaultCast",
+        frost       = "VFX_FrostCast",
+        shock       = "VFX_LightningCast",
+        poison      = "VFX_PoisonCast",
+
+        alteration  = "VFX_AlterationCast",
+        conjuration = "VFX_ConjureCast",
+        destruction = "VFX_DestructCast",
+        illusion    = "VFX_IllusionCast",
+        mysticism   = "VFX_MysticismCast",
+        restoration = "VFX_RestorationCast",
+    }
+
+    return map[element or ""] or map[school] or "VFX_DefaultCast"
+end
+
+local function _magExpModelFromStaticId(staticId)
+    if not staticId or staticId == "" then return nil end
+    local rid = tostring(staticId):lower()
+    local rec = types.Static.records[rid] or types.Weapon.records[rid]
+    return (rec and rec.model) or nil
+end
+
+local function _magExpEnsureActorVfxScript(actor)
+    -- Player already has AddVfx/RemoveVfx in magexp_player.lua
+    if not actor or not actor:isValid() then return end
+    if actor.type == types.Player then return end
+
+    -- Non-player actors need a local handler to interpret AddVfx/RemoveVfx events.
+    -- You already do this elsewhere for persistent effects; do it here too.
+    pcall(function() actor:addScript('scripts/OMW_MagExp/magexp_actor_vfx.lua') end)
+    pcall(function() actor:addScript('scripts/omw_magexp/magexp_actor_vfx.lua') end)
+end
+
+local function spawnCastVfxForAllEffects(attacker, spell, spellId, opts)
+    if not attacker or not attacker:isValid() then return end
+    if not spell or not spell.effects then return end
+    opts = opts or {}
+
+    if opts.muteCastVfx then return end
+
+    if not attacker.enabled then
+        debugLog("[CASTVFX] attacker not enabled, skipping cast VFX for " .. tostring(spellId))
+        return
+    end
+
+    _magExpEnsureActorVfxScript(attacker)
+
+        -- Attach all cast VFX to ACTOR ROOT only (no hands/head/etc).
+    -- In OpenMW, boneName default is "" (root). We set it explicitly. <!--citation:1-->
+    
+end
 local function launchSpell(data)
     print("[MagExp] launchSpell called with spellId:", data.spellId)
     local attacker  = data.attacker
@@ -1664,6 +1903,9 @@ local function launchSpell(data)
         return
     end
     print("[MagExp] Spell record found successfully!")
+-- ===================================================================
+-- [CAST VFX + SOUND] Spawn for ALL unique schools, right at cast start
+-- ===================================================================
 
     -- [FEATURE 4] nonRecastable: silently abort if spell is already active on the caster.
     print("[MagExp] Checking nonRecastable...")
@@ -1840,7 +2082,10 @@ local function launchSpell(data)
         end
     end
     print("[MagExp] Item requirements check passed!")
-
+    -- Spawn cast-start VFX for ALL effects (works even when OSSC calls MagExp_CastRequest directly)
+    spawnCastVfxForAllEffects(attacker, spell, spellId, {
+        muteCastVfx = data.muteCastVfx or false,
+    })
     local effectScale = coerceEffectScale(data.effectScale)
     print("[MagExp] Effect scale:", effectScale)
 
@@ -1910,7 +2155,7 @@ local function launchSpell(data)
     end
 
     -- ---- TOUCH ---- (only indexes in touchIndexes; Target effects are handled by projectile below)
-if #touchIndexes > 0 then
+ if #touchIndexes > 0 then
     debugLog(string.format("[TOUCH] Touch spell detected with %d effects", #touchIndexes))
     local obj = data.hitObject
     debugLog(string.format("[TOUCH] data.hitObject = %s", tostring(obj)))
@@ -2000,58 +2245,130 @@ if #targetIndexes == 0 then
     return
 end
 
-    -- ---- TARGET (projectile): only Target-range effect indices ----
-    local area = data.area
-    if area == nil then
-        area = maxAreaAmongIndexes(spell, targetIndexes)
+    -- ---- TARGET (projectile): one bolt per unique school in Target effects ----
+
+local area = data.area
+if area == nil then
+    area = maxAreaAmongIndexes(spell, targetIndexes)
+end
+area = area or 0
+if effectScale < 1 then
+    area = math.max(0, math.floor(area * effectScale + 0.5))
+end
+
+local effectIndexes = targetIndexes
+
+-- Group ONLY the Target-range effects by school.
+local schoolGroups = groupEffectIndexesBySchool(spell, effectIndexes)
+debugLog(string.format("[LAUNCH] Target effects grouped into %d school bolt(s).", #schoolGroups))
+
+if #schoolGroups == 0 then
+    return nil
+end
+
+-- Estimate distance once (for point-blank spawnOffset reduction)
+local estimatedTargetDistance = 0
+if data.hitObject and data.hitObject:isValid() then
+    local targetPos = getObjectCenter(data.hitObject) or data.hitObject.position
+    estimatedTargetDistance = (targetPos - startPos):length()
+elseif data.hitPos then
+    estimatedTargetDistance = (data.hitPos - startPos):length()
+end
+
+local spawnOffset = data.spawnOffset or 80
+if estimatedTargetDistance > 0 and estimatedTargetDistance < 100 then
+    spawnOffset = 10
+    debugLog(string.format(
+        "Point-blank range detected (%.1f units), using reduced spawnOffset: %d for %s",
+        estimatedTargetDistance, spawnOffset, spellId
+    ))
+end
+
+-- Base direction safety
+local baseDir = direction
+if not baseDir or (baseDir.length and baseDir:length() < 0.001) then
+    baseDir = util.vector3(0, 1, 0)
+else
+    baseDir = baseDir:normalize()
+end
+
+local recordId = data.projectileRecordId or "Colony_Assassin_act"
+
+-- Maintain the live enchanted item reference per projectile (your existing registry fix)
+local itemRecordId = nil
+if itemObject then
+    if type(itemObject) == "string" then
+        itemRecordId = itemObject
+    else
+        itemRecordId = itemObject.recordId
+        -- NOTE: the per-projectile registry entry is set per projectile below
     end
-    area = area or 0
+end
+
+local function safeAddScript(obj, path)
+    local ok = pcall(function() obj:addScript(path) end)
+    if not ok then
+        local altPath = path:gsub("/omw_magexp/", "/OMW_MagExp/")
+        if altPath == path then altPath = path:gsub("/OMW_MagExp/", "/omw_magexp/") end
+        pcall(function() obj:addScript(altPath) end)
+    end
+end
+
+local lastProj = nil
+
+for gi, group in ipairs(schoolGroups) do
+    debugLog(string.format(
+        "[LAUNCH] Bolt %d/%d school=%s effects=%d",
+        gi, #schoolGroups, tostring(group.school), #group.indexes
+    ))
+
+    -- Per-bolt AoE radius: max area among that bolt’s indexes
+    local boltArea = data.area
+    if boltArea == nil then
+        boltArea = maxAreaAmongIndexes(spell, group.indexes)
+    end
+    boltArea = boltArea or 0
     if effectScale < 1 then
-        area = math.max(0, math.floor(area * effectScale + 0.5))
+        boltArea = math.max(0, math.floor(boltArea * effectScale + 0.5))
     end
 
-    local effectIndexes = targetIndexes
-
-    local auto = autoDetectProjectileParams(spell, targetIndexes[1])
-
-    local vfxRecId    = data.vfxRecId    or auto.vfxRecId
-    local areaVfxRecId= data.areaVfxRecId or (auto.areaVfxRecId ~= "" and auto.areaVfxRecId or nil)
-    local boltModel   = data.boltModel   or auto.boltModel
-    local castModel   = data.castModel   or auto.castModel
-    local hitModel    = data.hitModel    or auto.hitModel
-    local particleTex = data.particleTex or auto.particleTex
-    local boltSound   = (data.muteAudio) and nil or (data.boltSound   or auto.boltSound)
-    local hitSound    = (data.muteAudio) and nil or (data.hitSound    or auto.hitSound)
-    local castSound   = (data.muteAudio) and nil or (data.castSound   or auto.castSound)
-    -- [FEATURE 2] Light: prefer explicit override, then auto color draft, then nil
-    local boltLightId = (data.muteLight) and nil or (data.boltLightId or auto.boltLightDraft)
-    local spinSpeed   = (data.spinSpeed ~= nil) and data.spinSpeed or auto.spinSpeed
-    -- [FEATURE 1] Speed: prefer explicit caller override, then engine mgef.speed, then 1500 fallback
-    local speed       = data.speed or auto.speed or 1500
-    local maxLifetime = data.maxLifetime or 10
-    local spawnOffset = data.spawnOffset or 80
+    -- ✅ NEW: Collect ALL unique VFX models for this school group's effects
+    local boltModels = {}      -- list of model paths
+    local particleTextures = {} -- list of particle override textures
+    local seenModels = {}
     
-    -- Point-blank range detection: reduce spawnOffset for close targets to prevent collision issues
-    local estimatedTargetDistance = 0
-    if data.hitObject and data.hitObject:isValid() then
-        local targetPos = getObjectCenter(data.hitObject) or data.hitObject.position
-        estimatedTargetDistance = (targetPos - startPos):length()
-    elseif data.hitPos then
-        estimatedTargetDistance = (data.hitPos - startPos):length()
+    for _, idx in ipairs(group.indexes) do
+        local auto = autoDetectProjectileParams(spell, idx)
+        
+        if auto.boltModel and auto.boltModel ~= "" and not seenModels[auto.boltModel] then
+            table.insert(boltModels, auto.boltModel)
+            seenModels[auto.boltModel] = true
+        end
+        
+        if auto.particleTex and auto.particleTex ~= "" then
+            table.insert(particleTextures, auto.particleTex)
+        end
     end
-    
-    -- If target is very close (point-blank range), use smaller spawn offset
-    if estimatedTargetDistance > 0 and estimatedTargetDistance < 100 then
-        spawnOffset = 10
-        debugLog(string.format("Point-blank range detected (%.1f units), using reduced spawnOffset: %d for %s", estimatedTargetDistance, spawnOffset, spellId))
-    end
-    
-    local recordId    = data.projectileRecordId or "Colony_Assassin_act"
 
-    local dir      = direction:normalize()
+    -- Auto-detect bolt params from the FIRST effect of THIS school group
+    local auto = autoDetectProjectileParams(spell, group.indexes[1])
+
+    local vfxRecId     = data.vfxRecId     or auto.vfxRecId
+    local areaVfxRecId = data.areaVfxRecId or (auto.areaVfxRecId ~= "" and auto.areaVfxRecId or nil)
+    local boltModel    = data.boltModel    or auto.boltModel
+    local hitModel     = data.hitModel     or auto.hitModel
+    local particleTex  = data.particleTex  or auto.particleTex
+    local boltSound    = (data.muteAudio) and nil or (data.boltSound or auto.boltSound)
+    local hitSound     = (data.muteAudio) and nil or (data.hitSound  or auto.hitSound)
+    local castSound    = (data.muteAudio) and nil or (data.castSound or auto.castSound)
+    local boltLightId  = (data.muteLight) and nil or (data.boltLightId or auto.boltLightDraft)
+    local spinSpeed    = (data.spinSpeed ~= nil) and data.spinSpeed or auto.spinSpeed
+    local speed        = data.speed or auto.speed or 1500
+    local maxLifetime  = data.maxLifetime or 10
+
+    local dir = baseDir
     local spawnPos = startPos + dir * spawnOffset
 
-    -- Initial rotation: caller can provide a full transform, otherwise auto-calculate from direction
     local rotation = data.initialRotation
     if not rotation then
         local yaw   = math.atan2(dir.x, dir.y)
@@ -2059,119 +2376,103 @@ end
         rotation = util.transform.rotateZ(yaw) * util.transform.rotateX(-pitch)
     end
 
-    -- [FEATURE 2] Cast glow: spawn school-specific cast VFX on caster, mirroring C++ addSpellCastGlow.
-    -- Duration is ~1.5s (the VFX animation's natural length), matching the engine constant.
-    if castModel ~= "" and not data.muteCastGlow and #targetIndexes == 0 then
-    pcall(function()
-        world.vfx.spawn(castModel, attacker.position, { attachToObject = attacker, mwMagicVfx = false })
-    end)
-    end
-
-    print("[MagExp] Attempting to create projectile with recordId:", recordId)
+    debugLog("[MagExp] Attempting to create projectile with recordId: " .. tostring(recordId))
     local proj = world.createObject(recordId, 1)
-    print("[MagExp] Created projectile object: " .. tostring(proj and proj.id or "NIL"))
+    debugLog("[MagExp] Created projectile object: " .. tostring(proj and proj.id or "NIL"))
     if not proj or not proj:isValid() then
-        print("[MagExp] ERROR: Failed to create valid projectile object!")
-        return nil
-    end
-    print("[MagExp] Teleporting projectile to:", attacker.cell.name, spawnPos)
-    pcall(function() proj:teleport(attacker.cell, spawnPos, rotation) end)
-    -- [FIX] Store the live item object in a registry keyed by projectile ID.
-    -- Passing itemObject.recordId (a string) loses the live object reference, which
-    -- prevents activeSpells:add from receiving the correct params.item field for
-    -- enchantment projectiles.  The registry is cleared on collision or expiry.
-    local itemRecordId = nil
-    if itemObject then
-        if type(itemObject) == "string" then
-            itemRecordId = itemObject
-        else
-            itemRecordId = itemObject.recordId
+        debugLog("[MagExp] ERROR: Failed to create valid projectile object for bolt " .. tostring(gi))
+    else
+        proj:teleport(attacker.cell, spawnPos, rotation)
+
+        -- Per-projectile registry for live item object (enchantments)
+        if itemObject and type(itemObject) ~= "string" then
             projectileItemRegistry[proj.id] = itemObject
         end
-    end
 
-    local function safeAddScript(obj, path)
-        local ok = pcall(function() obj:addScript(path) end)
-        if not ok then
-            local altPath = path:gsub("/omw_magexp/", "/OMW_MagExp/")
-            if altPath == path then altPath = path:gsub("/OMW_MagExp/", "/omw_magexp/") end
-            pcall(function() obj:addScript(altPath) end)
-        end
-    end
+        safeAddScript(proj, 'scripts/OMW_MagExp/magexp_projectile_local.lua')
 
-    safeAddScript(proj, 'scripts/OMW_MagExp/magexp_projectile_local.lua')
+        local initPayload = {
+            velocity        = dir * speed,
+            maxLifetime     = maxLifetime,
+            spinSpeed       = spinSpeed,
+            accelerationExp = data.accelerationExp,
+            maxSpeed        = data.maxSpeed,
 
-    -- [FIX] Defer MagExp_InitProjectile by one simulation tick.
-    -- addScript() schedules the script for attachment on the NEXT engine update; if
-    -- sendEvent is called immediately in the same frame the event arrives before
-    -- onInit runs, producing an inert projectile with no velocity or spellId.
-    local initPayload = {
-        -- Physics
-        velocity    = dir * speed,
-        maxLifetime = maxLifetime,
-        spinSpeed   = spinSpeed,
-        accelerationExp = data.accelerationExp,
-        maxSpeed    = data.maxSpeed,
-        -- Identity
-        attacker    = attacker,
-        spellId     = spellId,
-        itemRecordId = itemRecordId,
-        effectIndexes = effectIndexes,
-        effectScale   = effectScale,
-        area        = area,
-        -- Audio
-        boltSound   = boltSound,
-        hitSound    = hitSound,
-        castSound   = castSound,
-        -- Lighting
-        boltLightId = boltLightId,
-        -- VFX
-        boltModel   = boltModel,
-        hitModel    = hitModel,
-        vfxRecId    = vfxRecId,
-        areaVfxRecId = areaVfxRecId,
-        particle    = particleTex,
-        unreflectable = data.unreflectable,
-        casterLinked  = data.casterLinked,
-        isPaused      = data.isPaused,
-        direction     = dir,   -- [FIX] Always pass direction even if velocity is 0
-        areaVfxScale  = data.areaVfxScale,
-        userData      = data.userData,
-        muteAudio     = data.muteAudio,
-        muteLight     = data.muteLight,
-        continuousVfx = data.continuousVfx,
-        -- Bounce
-        bounceEnabled = data.bounceEnabled,
-        bounceMax     = data.bounceMax,
-        bouncePower   = data.bouncePower,
-        detonateOnActorHit = data.detonateOnActorHit,
-        -- Piercing
-        piercing      = data.piercing,
-        pierceLimit   = data.pierceLimit,
-        impactImpulse = data.impactImpulse,
-        anchorRecordId = data.anchorRecordId,
-    }
-    if proj and proj:isValid() then
+            attacker        = attacker,
+            spellId         = spellId,
+            itemRecordId    = itemRecordId,
+            effectIndexes   = group.indexes,
+            effectScale     = effectScale,
+            area            = boltArea,
+
+            boltSound       = boltSound,
+            hitSound        = hitSound,
+            castSound       = castSound,
+
+            boltLightId     = boltLightId,
+
+            -- ✅ CHANGED: Send ALL models + particles for layered VFX
+            boltModels      = boltModels,           -- NEW: table of all model paths
+            boltModel       = boltModels[1],        -- Fallback for old logic
+            particleTextures = particleTextures,     -- NEW: table of all particles
+            particle        = particleTextures[1],   -- Fallback for old logic
+            
+            hitModel        = auto.hitModel,
+            vfxRecId        = vfxRecId,
+            areaVfxRecId    = areaVfxRecId,
+
+            unreflectable   = data.unreflectable,
+            casterLinked    = data.casterLinked,
+            isPaused        = data.isPaused,
+            direction       = dir,
+            areaVfxScale    = data.areaVfxScale,
+            userData        = data.userData,
+            muteAudio       = data.muteAudio,
+            muteLight       = data.muteLight,
+            continuousVfx   = data.continuousVfx,
+
+            bounceEnabled       = data.bounceEnabled,
+            bounceMax           = data.bounceMax,
+            bouncePower         = data.bouncePower,
+            detonateOnActorHit  = data.detonateOnActorHit,
+
+            piercing       = data.piercing,
+            pierceLimit    = data.pierceLimit,
+            impactImpulse  = data.impactImpulse,
+            anchorRecordId = data.anchorRecordId,
+        }
+
         proj:sendEvent('MagExp_InitProjectile', initPayload)
-    end
 
-    -- Register in live spell registry for in-flight API access
-    if proj and proj:isValid() then
+        -- Register in live spell registry
         activeSpellRegistry[proj.id] = {
-            projectile = proj,
-            spellId    = spellId,
-            attacker   = attacker,
-            launchTime = core.getSimulationTime(),
-            maxSpeed   = data.maxSpeed or 0,
-            userData   = data.userData,
-            muteAudio  = data.muteAudio,
-            muteLight  = data.muteLight,
+            projectile    = proj,
+            spellId       = spellId,
+            attacker      = attacker,
+            launchTime    = core.getSimulationTime(),
+            maxSpeed      = data.maxSpeed or 0,
+            userData      = data.userData,
+            muteAudio     = data.muteAudio,
+            muteLight     = data.muteLight,
             continuousVfx = data.continuousVfx
         }
-    end
 
-    debugLog(string.format("Launched '%s' [%s] spd=%d spin=%.2f", tostring(spellId), tostring(recordId), speed, spinSpeed))
-    return proj
+        debugLog(string.format(
+            "[LAUNCH] Launched bolt %d/%d for '%s' school=%s spd=%d",
+            gi, #schoolGroups, tostring(spellId), tostring(group.school), speed
+        ))
+
+        lastProj = proj
+    end
+end
+-- [SKILL] Award progression for all schools after spell fires successfully
+local schools = collectSpellSchools(spell)
+for _, entry in ipairs(schools) do
+    awardSpellSkillProgress(attacker, entry.school, spell.cost)
+end
+
+return lastProj
+
 end
 
 -- ============================================================
@@ -2257,12 +2558,35 @@ local function onProjectileCollision(data)
     local isActor = target and target:isValid() and (target.type == types.NPC or target.type == types.Creature or target.type == types.Player)
     local isLockable = target and target:isValid() and (target.type == types.Door or target.type == types.Container)
 
-    if spellIsLockUnlock and isLockable then
-        handleDoorLockUnlock(spellId, attacker, target)
-    elseif isActor and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
-        applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale)
-    end
-
+if spellIsLockUnlock and isLockable then
+    handleDoorLockUnlock(spellId, attacker, target)
+elseif isActor and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
+    applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale)
+elseif not isActor and not isLockable and area == 0 then
+    debugLog("[COLLISION] Non-actor hit detected for non-AOE spell")
+    
+    local primaryEff = spell and spell.effects and spell.effects[(effectIndexes and effectIndexes[1] or 0) + 1]
+    if primaryEff then
+        local mgef = core.magic.effects.records[primaryEff.id]
+        if mgef then
+            local areaVfxId = deriveMagicEffectImpactAreaId(mgef)
+            if areaVfxId then
+                local rid = tostring(areaVfxId):lower()
+                local rec = types.Static.records[rid] or types.Weapon.records[rid]
+                if rec and rec.model then
+                    pcall(function()
+                        world.vfx.spawn(rec.model, hitPos, { 
+                            mwMagicVfx = false,
+                            scale = 1.0
+                        })
+                    end)
+                    debugLog(string.format("[COLLISION] Spawned area VFX: %s at %s", 
+                        areaVfxId, tostring(hitPos)))
+                end
+            end
+        end
+    end    
+end
     -- [MAXYARI] Physics impulse on detonation
     if data.impactImpulse and data.impactImpulse > 0
        and target and target:isValid()
@@ -2670,6 +2994,8 @@ local MagExpPublicInterface = {
         end
     end,
 
+
+    
     -- ----------------------------------------------------------------
     -- [FEATURE 6] Cross-Mod Charge Key Binding
     -- ----------------------------------------------------------------
@@ -2805,35 +3131,266 @@ return {
             if not ok then pcall(function() anchor:addScript('scripts/omw_magexp/magexp_projectile_local.lua') end) end
             data.projectile:sendEvent('MagExp_SetLightAnchor', { anchor = anchor })
         end,
+MagExp_CastStart = function(data)
+    local attacker = data and data.attacker
+    local spellId  = data and data.spellId
+    if not attacker or not attacker:isValid() or not spellId then return end
 
-        MagExp_ProcessCast = function(data)
-    local actor = data.actor
-    if not actor or not actor:isValid() then return end
-    local spell = core.magic.spells.records[data.spellId] or core.magic.enchantments.records[data.spellId]
-    if not spell then return end
-    
-    -- NEW: Treat 100% calculated chance the same as alwaysSucceedFlag
-    -- Resolves BEFORE the random roll so the animation commits immediately
-    local chance = getSpellSuccessChance(spell, actor, data.isGodMode)
-    local success = (chance >= 100) or (math.random(0, 99) < chance)
-    
-    if success then
-        actor:sendEvent('MagExp_CastResult', {
-            spellId = data.spellId,
-            success = true,
-            item    = data.item,
-            isFree  = data.isFree
-        })
-    else
-        actor:sendEvent('MagExp_CastResult', {
-            spellId = data.spellId,
-            success = false
-        })
-        if actor.enabled then
-            pcall(function() core.sound.playSound3d("spell failure destruction", actor) end)
+    -- Throttle: avoid duplicates (play handler + key handler + your own calls)
+    MagExp_CastStartThrottle = MagExp_CastStartThrottle or {}
+    local now = core.getSimulationTime()
+    local tkey = tostring(attacker.id) .. "::" .. tostring(spellId)
+    if MagExp_CastStartThrottle[tkey] and (now - MagExp_CastStartThrottle[tkey]) < 0.20 then
+        return
+    end
+    MagExp_CastStartThrottle[tkey] = now
+
+    -- Resolve spell record (supports Generated:0x...)
+    local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    if not spell then
+        for _, rec in pairs(core.magic.spells.records) do
+            local ok, recId = pcall(function() return rec.id end)
+            if ok and recId and tostring(recId):lower() == tostring(spellId):lower() then
+                spell = rec
+                break
+            end
         end
     end
-    end,
+    if not spell or not spell.effects then
+        debugLog("[CASTSTART] No spell/effects for " .. tostring(spellId))
+        return
+    end
+
+    -- Ensure NPCs can respond to AddVfx/RemoveVfx (player already can)
+    if attacker.type ~= types.Player then
+        pcall(function() attacker:addScript('scripts/OMW_MagExp/magexp_actor_vfx.lua') end)
+        pcall(function() attacker:addScript('scripts/omw_magexp/magexp_actor_vfx.lua') end)
+    end
+
+    local function modelFromStaticId(staticId)
+        if not staticId or staticId == "" then return nil end
+        local rid = tostring(staticId):lower()
+        local rec = types.Static.records[rid] or types.Weapon.records[rid]
+        return rec and rec.model or nil
+    end
+
+    local function elementKeyOf(mgef, effIdFallback)
+        local name = (mgef and mgef.name or ""):lower()
+        local id   = (mgef and mgef.id   or effIdFallback or ""):lower()
+        if name:find("fire") or id:find("fire") then return "fire" end
+        if name:find("frost") or id:find("frost") or name:find("cold") or id:find("cold") then return "frost" end
+        if name:find("shock") or id:find("shock") or name:find("lightning") or id:find("lightning") then return "shock" end
+        if name:find("poison") or id:find("poison") then return "poison" end
+        return nil
+    end
+
+    local function schoolKeyOf(mgef)
+        local s = mgef and mgef.school
+        if type(s) == "string" then return s:lower() end
+        if type(s) == "number" then
+            local map = { [0]="alteration",[1]="conjuration",[2]="destruction",[3]="illusion",[4]="mysticism",[5]="restoration" }
+            return map[s] or "default"
+        end
+        return "default"
+    end
+
+    local function fallbackCastStaticId(mgef, effIdFallback)
+        local element = elementKeyOf(mgef, effIdFallback)
+        local school  = schoolKeyOf(mgef)
+        local map = {
+            fire        = "VFX_DefaultCast",
+            frost       = "VFX_FrostCast",
+            shock       = "VFX_LightningCast",
+            poison      = "VFX_PoisonCast",
+            alteration  = "VFX_AlterationCast",
+            conjuration = "VFX_ConjureCast",
+            destruction = "VFX_DestructCast",
+            illusion    = "VFX_IllusionCast",
+            mysticism   = "VFX_MysticismCast",
+            restoration = "VFX_RestorationCast",
+        }
+        return map[element or ""] or map[school] or "VFX_DefaultCast"
+    end
+
+    debugLog(string.format("[CASTSTART] Spawning ROOT cast VFX for %s (%d effects)",
+        tostring(spellId), #spell.effects))
+
+    -- ROOT ONLY: boneName = "" (no hands)
+    local rootBone = ""
+
+    for i, eff in ipairs(spell.effects) do
+        local mgef = core.magic.effects.records[eff.id]
+        if mgef then
+            -- Prefer correct OpenMW field (castStatic); fall back if missing
+            local castStaticId = (mgef.castStatic and mgef.castStatic ~= "") and mgef.castStatic or fallbackCastStaticId(mgef, eff.id)
+            local model = modelFromStaticId(castStaticId)
+
+            local vfxId = string.format("MagExpCastStart_%s_%d_%s",
+                tostring(spellId), i, tostring(eff.id):lower())
+
+            debugLog(string.format("[CASTSTART] eff#%d id=%s castStatic=%s model=%s vfxId=%s",
+                i, tostring(eff.id), tostring(castStaticId), tostring(model), tostring(vfxId)))
+
+            if model then
+                local delay = (i - 1) * 0.02
+                async:newUnsavableSimulationTimer(delay, function()
+                    if not attacker or not attacker:isValid() then return end
+
+                    attacker:sendEvent('AddVfx', {
+                        model = model,
+                        options = {
+                            loop = false,
+                            boneName = rootBone, -- ROOT
+                            particleTextureOverride = mgef.particle or "",
+                            vfxId = vfxId,
+                            useAmbientLight = true,
+                        }
+                    })
+
+                    async:newUnsavableSimulationTimer(1.2, function()
+                        if attacker and attacker:isValid() then
+                            pcall(function() attacker:sendEvent('RemoveVfx', vfxId) end)
+                        end
+                    end)
+                end)
+            end
+        end
+    end
+end,
+MagExp_ProcessCast = function(data)
+    local actor = data and data.actor
+    if not actor or not actor:isValid() then return end
+
+    local spellId = data.spellId
+    local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    if not spell then return end
+
+    local chance = getSpellSuccessChance(spell, actor, data.isGodMode)
+    local success = (chance >= 100) or (math.random(0, 99) < chance)
+
+    if not success then
+        actor:sendEvent('MagExp_CastResult', { spellId = spellId, success = false })
+        if actor.enabled then
+            core.sound.playSound3d("spell failure destruction", actor)
+        end
+        return
+    end
+
+    local function schoolKeyOf(mgef)
+        local s = mgef and mgef.school
+        if type(s) == "string" then return s:lower() end
+        if type(s) == "number" then
+            local map = {
+                [0] = "alteration",
+                [1] = "conjuration",
+                [2] = "destruction",
+                [3] = "illusion",
+                [4] = "mysticism",
+                [5] = "restoration",
+            }
+            return map[s] or "default"
+        end
+        return "default"
+    end
+
+    local function elementKeyOf(mgef, effIdFallback)
+        local name = (mgef and mgef.name or ""):lower()
+        local id   = (mgef and mgef.id   or effIdFallback or ""):lower()
+        if name:find("fire") or id:find("fire") then return "fire" end
+        if name:find("frost") or id:find("frost") or name:find("cold") or id:find("cold") then return "frost" end
+        if name:find("shock") or id:find("shock") or name:find("lightning") or id:find("lightning") then return "shock" end
+        if name:find("poison") or id:find("poison") then return "poison" end
+        return nil
+    end
+
+    local function modelFromStaticId(staticId)
+        if not staticId or staticId == "" then return nil end
+        local rid = tostring(staticId):lower()
+        local rec = types.Static.records[rid] or types.Weapon.records[rid]
+        return (rec and rec.model) or nil
+    end
+
+    local function resolveCastStaticId(mgef, elementKey, schoolKey)
+        -- Correct OpenMW field:
+        local sid = mgef.castStatic
+        if sid and sid ~= "" then return sid end
+
+        -- Fallback map (only if castStatic missing):
+        local map = {
+            fire        = "VFX_DefaultCast",
+            frost       = "VFX_FrostCast",
+            shock       = "VFX_LightningCast",
+            poison      = "VFX_PoisonCast",
+
+            alteration  = "VFX_AlterationCast",
+            conjuration = "VFX_ConjureCast",
+            destruction = "VFX_DestructCast",
+            illusion    = "VFX_IllusionCast",
+            mysticism   = "VFX_MysticismCast",
+            restoration = "VFX_RestorationCast",
+        }
+        return map[elementKey or ""] or map[schoolKey or ""] or "VFX_DefaultCast"
+    end
+
+    local function resolveCastSound(mgef, elementKey, schoolKey)
+        if mgef.castSound and mgef.castSound ~= "" then
+            return mgef.castSound
+        end
+        local map = {
+            fire        = "destruction cast",
+            frost       = "frost cast",
+            shock       = "shock cast",
+            poison      = "destruction cast",
+            alteration  = "alteration cast",
+            conjuration = "conjuration cast",
+            destruction = "destruction cast",
+            illusion    = "illusion cast",
+            mysticism   = "mysticism cast",
+            restoration = "restoration cast",
+        }
+        return map[elementKey or ""] or map[schoolKey or ""] or "destruction cast"
+    end
+
+    -- Build castVfx list: dedupe by castStaticId first (best), otherwise by element/school
+    local castVfx = {}
+    local seen = {}
+
+    if spell.effects then
+        for _, eff in ipairs(spell.effects) do
+            local mgef = core.magic.effects.records[eff.id]
+            if mgef then
+                local schoolKey  = schoolKeyOf(mgef)
+                local elementKey = elementKeyOf(mgef, eff.id)
+
+                local castStaticId = resolveCastStaticId(mgef, elementKey, schoolKey)
+                local model = modelFromStaticId(castStaticId)
+
+                local key = (castStaticId and castStaticId ~= "" and tostring(castStaticId):lower())
+                            or elementKey or schoolKey or "default"
+
+                if not seen[key] then
+                    seen[key] = true
+                    table.insert(castVfx, {
+                        key      = key,
+                        model    = model,                -- may be nil if record missing
+                        sound    = resolveCastSound(mgef, elementKey, schoolKey),
+                        particle = mgef.particle or "",  -- texture id/path for override (optional)
+                        element  = elementKey,
+                        school   = schoolKey,
+                    })
+                end
+            end
+        end
+    end
+
+    actor:sendEvent('MagExp_CastResult', {
+        spellId = spellId,
+        success = true,
+        item    = data.item,
+        isFree  = data.isFree,
+        castVfx = castVfx,   -- NEW: structured list the player will spawn
+    })
+end,
 
         --- Internal: Sync physics updates from local to global registry
         MagExp_UpdateRegistry = function(data)

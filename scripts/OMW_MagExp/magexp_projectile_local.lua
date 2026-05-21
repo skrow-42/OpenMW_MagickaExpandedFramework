@@ -58,7 +58,7 @@ local baseDir      = util.vector3(0, 1, 0)
 -- ---- VFX identity ----
 local vfxRecId        = nil   -- BUG FIX: was referenced in collision payload without declaration
 local areaVfxRecId    = nil
-
+local boltVfxId = nil
 -- ---- Bounce system ----
 local bounceEnabled      = false
 local bounceMax          = 0       -- 0 = unlimited bounces until lifetime expires
@@ -97,9 +97,9 @@ local function stopSound()
         core.sendGlobalEvent('MagExp_RemoveObject', lightAnchor)
         lightAnchor = nil
     end
-    if boltVfxHandle then
-        boltVfxHandle:remove()
-        boltVfxHandle = nil
+    if boltVfxId and boltVfxId ~= "" then
+        pcall(function() anim.removeVfx(self, boltVfxId) end)
+        boltVfxId = nil
     end
 end
 
@@ -165,25 +165,64 @@ local function onInit(data)
             signedSpeed = velocity:length()
         end
 
-        if data.boltModel and data.boltModel ~= "" then
-            print("[MagExp] Adding VFX model:", data.boltModel)
+        -- ============================================================
+        -- ✅ FIX #3: LAYERED VFX for multi-element destruction spells
+        -- Spawns ALL unique bolt VFX models simultaneously on the projectile.
+        -- ============================================================
+        if data.boltModels and #data.boltModels > 0 then
+            print(string.format("[MagExp] Layering %d bolt VFX models on projectile", #data.boltModels))
+            
+            for i, model in ipairs(data.boltModels) do
+                local vfxId = string.format("MagExpBolt_%s_%d", tostring(self.id), i)
+                local particle = (data.particleTextures and data.particleTextures[i]) or ""
+                
+                print(string.format("[MagExp] Adding VFX layer %d/%d: model=%s particle=%s vfxId=%s",
+                    i, #data.boltModels, tostring(model), tostring(particle), vfxId))
+                
+                local opts = {
+                    loop = true,
+                    vfxId = vfxId,
+                    boneName = "", -- projectiles usually don't have bones
+                }
+                
+                if particle ~= "" then
+                    opts.particleTextureOverride = particle
+                end
+                
+                pcall(function()
+                    anim.addVfx(self, model, opts)
+                end)
+            end
+            
+        elseif data.boltModel and data.boltModel ~= "" then
+            -- Fallback: single VFX (backward compatibility with old spells/mods)
+            boltVfxId = vfxRecId or ("MagExp_Bolt_" .. tostring(self.id))
+
+            print(string.format("[MagExp] Adding single projectile bolt VFX: model=%s vfxId=%s",
+                tostring(data.boltModel), tostring(boltVfxId)))
+
             local opts = {
-                useAmbientLight = true,
-                loop            = true,
-                vfxId           = vfxRecId or "MagExp_SpellVFX"
+                loop = true,
+                vfxId = boltVfxId,
+                boneName = "",
             }
+            
             if data.particle and data.particle ~= "" then
                 opts.particleTextureOverride = data.particle
             end
-            boltVfxHandle = anim.addVfx(self, data.boltModel, opts)
-            print("[MagExp] VFX handle:", boltVfxHandle and "SUCCESS" or "FAILED")
-        else
-            print("[MagExp] No boltModel provided!")
+
+            pcall(function()
+                anim.addVfx(self, data.boltModel, opts)
+            end)
         end
 
         -- Request Sound Anchor creation on global side
         if boltSound and boltSound ~= "" then
-            core.sendGlobalEvent('MagExp_CreateSoundAnchor', { recordId = anchorRecordId, sound = boltSound, projectile = self })
+            core.sendGlobalEvent('MagExp_CreateSoundAnchor', { 
+                recordId = anchorRecordId, 
+                sound = boltSound, 
+                projectile = self 
+            })
             boltSound = nil
         end
 

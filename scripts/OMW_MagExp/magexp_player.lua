@@ -14,18 +14,18 @@ local camera  = require('openmw.camera')
 local util    = require('openmw.util')
 local debug   = require('openmw.debug')
 local I       = require('openmw.interfaces')
-local nearby = require('openmw.nearby')
+local async   = require('openmw.async')
+local nearby  = require('openmw.nearby')
+
 -- ---- State Management ----
 local busyUntil        = 0
 local hasQueuedLaunch  = false
 local pendingLaunches  = {}
 
 -- ---- [FEATURE 5] Charged Spell State ----
-local currentChargeData = nil  -- { animGroup, chargeKey, priority, blendMask, isCharging }
+local currentChargeData = nil
 
--- ---- [CHARGE-AS-CAST] Tracks a chargeKey that was passed alongside the cast request.
--- If the key is still held when the 'start' text key fires, the cast enters charge loop
--- instead of proceeding directly to 'release'.
+-- ---- [CHARGE-AS-CAST] ----
 local pendingChargeKey = nil
 
 -- ============================================================
@@ -46,11 +46,68 @@ local function debugLog(msg)
 end
 
 -- ============================================================
+-- [CAST START GROUP WHITELIST]
+-- Only these groups trigger casting VFX on their 'start' key.
+-- We deliberately exclude "spellcast" and release-phase groups.
+-- ============================================================
+local VFX_CAST_GROUPS = {
+    quickcast = true,
+    quickbuff = true,
+    qcconj    = true,
+    qctouch   = true,
+    qcalt     = true,
+    qcalts    = true,
+    qcill     = true,
+    qcsnap    = true,
+    qcdrain   = true,
+    qcskrow   = true,
+}
+
+local castStartLatched = {}
+local vfxTriggeredThisCast = false
+local lastCastStartSentTime = -999
+local lastCastStartSpellId  = nil
+
+local function shouldTriggerVfxOnStart(groupname)
+    local g = tostring(groupname or ""):lower()
+    return VFX_CAST_GROUPS[g] == true
+end
+
+local function isWhitelistedCastGroup(groupname)
+    local g = tostring(groupname or ""):lower()
+    return VFX_CAST_GROUPS[g] == true
+end
+
+local function sendCastStartNow(reason, groupname)
+    if IS_OSSC_LOADED then
+        debugLog("OSSC active - sending CastStart from MagExp for group: " .. tostring(groupname))
+    end
+
+    local t = core.getSimulationTime()
+    local spell = nil
+    pcall(function() spell = types.Actor.getSelectedSpell(self) end)
+    local spellId = spell and spell.id
+    if not spellId then return end
+
+    if lastCastStartSpellId == spellId and (t - lastCastStartSentTime) < 0.25 then
+        return
+    end
+
+    lastCastStartSentTime = t
+    lastCastStartSpellId  = spellId
+
+    print(string.format("[MagExp-Player] CastStart (%s): group=%s spellId=%s",
+        tostring(reason), tostring(groupname), tostring(spellId)))
+
+    core.sendGlobalEvent('MagExp_CastStart', {
+        attacker = self,
+        spellId  = spellId,
+    })
+end
+
+-- ============================================================
 -- [HELPERS] Launch Parameter Calculation
 -- ============================================================
-
-
-local nearby = require('openmw.nearby')
 
 local function calculateLaunchPayload(spell, item)
     local cameraMode = camera.getMode()
@@ -59,37 +116,33 @@ local function calculateLaunchPayload(spell, item)
     if cameraMode == camera.MODE.FirstPerson then
         startPos  = camera.getPosition()
         direction = camera.getViewDirection()
-        startPos = startPos + camera.getUp() * -10 + camera.getLeft() * 15
+        startPos  = startPos + camera.getUp() * -10 + camera.getLeft() * 15
     else
         startPos  = self.position + util.vector3(0, 0, 120)
         direction = camera.getViewDirection()
-        startPos = startPos + camera.getLeft() * 25
+        startPos  = startPos + camera.getLeft() * 25
     end
 
     print("[MagExp-Player] Starting raycast from: " .. tostring(startPos))
     print("[MagExp-Player] Direction: " .. tostring(direction))
 
     local hitObject = nil
-    local hitPos = nil
-    
+    local hitPos    = nil
+
     local rayOk, rayErr = pcall(function()
         local endPos = startPos + direction * 300
         print("[MagExp-Player] Ray end position: " .. tostring(endPos))
-        
-        local rayResult = nearby.castRay(startPos, endPos, {
-            ignore = self,
-        })
-        
+
+        local rayResult = nearby.castRay(startPos, endPos, { ignore = self })
         print("[MagExp-Player] Raycast result: " .. tostring(rayResult))
-        
+
         if rayResult then
             print("[MagExp-Player] Ray hit something!")
             print("[MagExp-Player] hitObject: " .. tostring(rayResult.hitObject))
             print("[MagExp-Player] hitPos: " .. tostring(rayResult.hitPos))
-            
             if rayResult.hitObject then
                 hitObject = rayResult.hitObject
-                hitPos = rayResult.hitPos
+                hitPos    = rayResult.hitPos
                 print("[MagExp-Player] Hit object type: " .. tostring(hitObject.type))
                 print("[MagExp-Player] Hit object recordId: " .. tostring(hitObject.recordId))
             end
@@ -97,11 +150,11 @@ local function calculateLaunchPayload(spell, item)
             print("[MagExp-Player] Raycast returned nil")
         end
     end)
-    
+
     if not rayOk then
         print("[MagExp-Player] Raycast ERROR: " .. tostring(rayErr))
     end
-    
+
     print("[MagExp-Player] Final hitObject for payload: " .. tostring(hitObject))
 
     return {
@@ -118,8 +171,6 @@ end
 
 -- ============================================================
 -- [INTERNAL] Charge key held check helper.
--- Safely calls the registered predicate for a given keyId.
--- Returns true only if the key is registered AND currently held.
 -- ============================================================
 local function isChargeKeyCurrentlyHeld(keyId)
     if not keyId then return false end
@@ -136,92 +187,82 @@ end
 -- ============================================================
 -- [CORE] Animation Sync & Lifecycle
 -- ============================================================
+-- ============================================================
+-- CORE TEXT KEY HANDLER
+-- ============================================================
 local function onTextKey(groupname, key)
-    if not hasQueuedLaunch then return end
-
+    local g = tostring(groupname or ""):lower()
     local k = tostring(key):lower()
 
-    -- --------------------------------------------------------
-    -- "start" key: end of the initial cast wind-up phase.
-    -- If a chargeKey was registered for this cast AND the key
-    -- is still held at this point, enter the charge loop
-    -- instead of letting the animation proceed to "release".
-    -- --------------------------------------------------------
+    -- VFX ONLY on the initial cast group's 'start' key
     if k == "start" then
-        if pendingChargeKey and isChargeKeyCurrentlyHeld(pendingChargeKey) then
-            debugLog("Charge key held at 'start' — entering charge loop for: " .. tostring(pendingChargeKey))
-
-            -- Register charge state so onUpdate can poll the key each frame
-            currentChargeData = {
-                animGroup  = "spellcast",
-                chargeKey  = pendingChargeKey,
-                priority   = 1,
-                blendMask  = 15,
-                isCharging = true,
-            }
-
-            -- Re-play spellcast with loop = true so it stays in the charge phase.
-            -- OpenMW will cycle at the loop start/stop markers in the NIF/KF.
-            -- onUpdate will detect key release and call anim.play with loop = false
-            -- to proceed forward through to 'release' naturally.
-            pcall(function()
-                anim.play(self, "spellcast", 1, 15, true, 1.0)
-            end)
-            -- Do NOT clear pendingChargeKey here — onUpdate needs it.
+        if shouldTriggerVfxOnStart(g) and not vfxTriggeredThisCast then
+            vfxTriggeredThisCast = true
+            castStartLatched[g] = true
+            sendCastStartNow("textKey:start", g)
         end
-        -- If key is NOT held (or no chargeKey registered), do nothing:
-        -- the animation continues playing normally toward 'release'.
-        return
     end
 
-    -- --------------------------------------------------------
-    -- "release" key: spell fires here (standard path AND after
-    -- charge loop completes).
-    -- --------------------------------------------------------
-    if k == "release" then
-        debugLog("Animation Release Key Detected: " .. k)
-        for spellId, item in pairs(pendingLaunches) do
-            local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
-            if spell then
-                local payload = calculateLaunchPayload(spell, item)
-                core.sendGlobalEvent('MagExp_CastRequest', payload)
-            end
-        end
-        pendingLaunches  = {}
-        hasQueuedLaunch  = false
-        -- Clear charge state once the spell has fired
-        if currentChargeData then
-            currentChargeData.isCharging = false
-        end
-        return
-    end
-
-    -- --------------------------------------------------------
-    -- "stop" key: animation fully finished, clean everything up.
-    -- --------------------------------------------------------
+    -- Reset on stop
     if k == "stop" then
-        hasQueuedLaunch  = false
-        pendingLaunches  = {}
+        if isWhitelistedCastGroup(g) or g == "spellcast" then
+            castStartLatched[g] = true
+            vfxTriggeredThisCast = false
+        end
+    end
+
+    -- Only MagExp's own queued casts
+    if not hasQueuedLaunch then return end
+
+    -- if k == "start" then
+    --     if pendingChargeKey and isChargeKeyCurrentlyHeld(pendingChargeKey) then
+    --         debugLog("Charge key held at 'start' — entering charge loop")
+    --         currentChargeData = {
+    --             animGroup  = "spellcast",
+    --             chargeKey  = pendingChargeKey,
+    --             priority   = 1,
+    --             blendMask  = 15,
+    --             isCharging = true,
+    --         }
+    --         pcall(function() anim.play(self, "spellcast", 1, 15, true, 1.0) end)
+    --     end
+    --     return
+    -- end
+
+    -- if k == "release" then
+    --     debugLog("MagExp Release Key Triggered - launching spell")
+    --     for spellId, item in pairs(pendingLaunches) do
+    --         local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    --         if spell then
+    --             local payload = calculateLaunchPayload(spell, item)
+    --             core.sendGlobalEvent('MagExp_CastRequest', payload)
+    --         end
+    --     end
+    --     pendingLaunches  = {}
+    --     hasQueuedLaunch  = false
+    --     if currentChargeData then currentChargeData.isCharging = false end
+    --     return
+    -- end
+
+    if k == "stop" then
+        hasQueuedLaunch   = false
+        pendingLaunches   = {}
         currentChargeData = nil
-        pendingChargeKey  = nil   -- always clear on full animation end
+        pendingChargeKey  = nil
+        vfxTriggeredThisCast = false
         return
     end
 end
-
 -- ============================================================
--- [UPDATE] Charge Key Polling
--- Polls the registered charge key each frame while in charge mode.
--- When the key is released, resumes the animation without looping
--- so it naturally proceeds to the 'release' text key → spell fires.
+-- [UPDATE] Charge Key Polling + Cast latch safety cleanup
 -- ============================================================
 local function onUpdate(dt)
+    -- Charge loop polling
     if currentChargeData and currentChargeData.isCharging then
         local chargeKey = currentChargeData.chargeKey
         local isHeld    = isChargeKeyCurrentlyHeld(chargeKey)
 
         if not isHeld then
-            -- Key released: switch from looping to single-play so the animation
-            -- proceeds forward through 'release' → spell fires → 'stop'.
             debugLog("Charge key released — proceeding to release key")
             currentChargeData.isCharging = false
             pendingChargeKey = nil
@@ -229,38 +270,35 @@ local function onUpdate(dt)
                 anim.play(self, currentChargeData.animGroup,
                     currentChargeData.priority or 7,
                     currentChargeData.blendMask or 15,
-                    false,   -- no loop → will reach 'release' naturally
-                    1.0)
+                    false, 1.0)
             end)
+        end
+    end
+
+    -- Safety: clear stale latches
+    for g, _ in pairs(VFX_CAST_GROUPS) do
+        local playing = false
+        pcall(function() playing = anim.isPlaying(self, g) end)
+        if not playing then
+            castStartLatched[g] = nil
         end
     end
 end
 
 -- ============================================================
 -- [EVENT] MagExp_StartQuickCast
---
--- Accepts an optional 'chargeKey' field (string).
--- If provided, the cast key doubles as the charge key:
---   - If held through the 'start' animation text key → charge loop.
---   - If released before 'start' → normal instant cast to 'release'.
---
--- Usage example (from a player/local script):
---   self:sendEvent('MagExp_StartQuickCast', {
---       spellId   = "fireball",
---       chargeKey = "MyMod_CastKey",  -- the key registered via I.MagExp.registerChargeKey
---   })
 -- ============================================================
 local function startQuickCast(data)
     local spellId = data.spellId
-    local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    local spell   = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell then return end
 
     debugLog("Initiating Quick Cast sequence for: " .. spellId)
 
-    -- Store which chargeKey (if any) was passed alongside this cast.
-    -- onTextKey 'start' will read this to decide whether to enter charge loop.
     pendingChargeKey = data.chargeKey or nil
 
+    -- Cast VFX is handled by the animation hooks (addPlayBlendedAnimationHandler / textKey:start).
+    -- Do NOT send MagExp_CastStart here — it will be sent when the anim starts.
     core.sendGlobalEvent('MagExp_ProcessCast', {
         actor     = self,
         spellId   = spellId,
@@ -270,34 +308,82 @@ local function startQuickCast(data)
     })
 end
 
+-- ============================================================
+-- [EVENT] MagExp_CastResult
+-- ============================================================
 local function handleCastResult(data)
     if data.success then
         debugLog("Cast Authorization: SUCCESS")
+
         hasQueuedLaunch = true
         pendingLaunches[data.spellId] = data.item
 
-        -- Trigger casting animation. The 'start' text key handler will decide
-        -- whether to continue normally or enter the charge loop.
         anim.playBlended(self, "spellcast", { priority = 1, blend = 0.2 })
     else
         debugLog("Cast Authorization: FAILED (Roll/Magicka)")
         ui.showMessage("You failed casting the spell.")
-        -- Reset charge key on failure so it doesn't leak into the next cast.
         pendingChargeKey = nil
     end
 end
 
+-- ============================================================
+-- ANIMATION HOOKS
+-- ============================================================
 if I.AnimationController then
     I.AnimationController.addTextKeyHandler('', onTextKey)
+
+    if I.AnimationController.addPlayBlendedAnimationHandler then
+        I.AnimationController.addPlayBlendedAnimationHandler(function(groupname, options)
+            local g = tostring(groupname or ""):lower()
+            if isWhitelistedCastGroup(g) then
+                castStartLatched[g] = false   -- reset latch so 'start' key can fire VFX
+            end
+        end)
+    end
 end
 
+-- ============================================================
+-- EVENT + ENGINE HANDLER TABLE
+-- ============================================================
 local handlers = {
     engineHandlers = {
-        onUpdate  = onUpdate,
+        onUpdate = onUpdate,
     },
     eventHandlers = {
         MagExp_StartQuickCast = startQuickCast,
         MagExp_CastResult     = handleCastResult,
+
+        -- [SKILL] Progression from global script
+        MagExp_AwardSkillProgress = function(data)
+            if not data or not data.school or not data.progress then return end
+
+            local skillMap = {
+                alteration  = "alteration",
+                conjuration = "conjuration",
+                destruction = "destruction",
+                illusion    = "illusion",
+                mysticism   = "mysticism",
+                restoration = "restoration",
+            }
+
+            local skillId = skillMap[data.school:lower()]
+            if not skillId then
+                print("[MagExp-Player] Unknown school for skill progression: " .. tostring(data.school))
+                return
+            end
+
+            local skillStat = types.Player.stats.skills[skillId]
+            if not skillStat then
+                print("[MagExp-Player] Skill stat not found for: " .. skillId)
+                return
+            end
+
+            local stat = skillStat(self)
+            if stat and stat.progress ~= nil then
+                stat.progress = stat.progress + data.progress
+                print(string.format("[MagExp-Player] Awarded %.2f progress to %s", data.progress, skillId))
+            end
+        end,
 
         -- [FEATURE 5] Custom animation override from launchSpellAnim()
         MagExp_PlaySpellAnim = function(data)
@@ -307,7 +393,6 @@ local handlers = {
             local priority = data.priority  or 7
 
             debugLog("MagExp_PlaySpellAnim: " .. group .. " (priority=" .. priority .. " mask=" .. mask .. ")")
-
             anim.play(self, group, priority, mask, false, 1.0)
 
             if data.isCharged then
@@ -321,8 +406,8 @@ local handlers = {
                 debugLog("Charged spell started: " .. group .. " key=" .. tostring(data.chargeKey))
             end
         end,
-        -- [FEATURE 5] Graceful release: resumes normal playback so the 'release'
-        -- text key fires naturally → spell launches → 'stop' clears state.
+
+        -- [FEATURE 5] Graceful release of charged spell animation
         MagExp_ReleaseSpellAnim = function(data)
             if not data or not data.animGroup then return end
             debugLog("MagExp_ReleaseSpellAnim: " .. data.animGroup)
@@ -339,11 +424,19 @@ local handlers = {
 
         -- VFX Utilities
         AddVfx = function(data)
+            if not data or not data.model then return end
+            print(string.format("[MagExp-Player] AddVfx model=%s vfxId=%s bone=%s",
+                tostring(data.model),
+                tostring(data.options and data.options.vfxId),
+                tostring(data.options and data.options.boneName)
+            ))
             anim.addVfx(self, data.model, data.options)
         end,
+
         RemoveVfx = function(vfxId)
             anim.removeVfx(self, vfxId)
         end,
+
         RemoveVfxDirect = function(vfxId)
             anim.removeVfx(self, vfxId)
         end,
@@ -353,21 +446,19 @@ local handlers = {
             if type(msg) == "string" then ui.showMessage(msg) end
         end,
 
-        -- Resource consumption: magicka here; scroll/charge via global event (inventory mutations).
+        -- Resource consumption
         MagExp_ConsumeResource = function(data)
             pcall(function()
                 if data.magickaCost then
                     local magicka = types.Actor.stats.dynamic.magicka(self)
                     magicka.current = math.max(0, magicka.current - data.magickaCost)
                 end
-                -- Scroll / charge must run in global script (OpenMW restriction). Interface calls from
-                -- player scripts are not guaranteed to execute with global permissions; use global event.
                 if (data.itemCountCost and data.itemRecordId) or (data.itemChargeCost and data.itemRecordId) then
                     core.sendGlobalEvent('MagExp_ApplyInventoryConsume', {
-                        attacker = self,
-                        item = data.item,
-                        itemCountCost = data.itemCountCost,
-                        itemRecordId = data.itemRecordId,
+                        attacker       = self,
+                        item           = data.item,
+                        itemCountCost  = data.itemCountCost,
+                        itemRecordId   = data.itemRecordId,
                         itemChargeCost = data.itemChargeCost,
                     })
                 end
@@ -377,7 +468,7 @@ local handlers = {
 }
 
 -- ============================================================
--- [PUBLIC LOCAL API] For other player scripts (like OSSC, Kinetic Forces)
+-- [PUBLIC LOCAL API] For other player scripts
 -- ============================================================
 local MagExp_PlayerInterface = {
     consumeSpellCost = function(spellId, itemObject)
