@@ -17,6 +17,8 @@ local I       = require('openmw.interfaces')
 local async   = require('openmw.async')
 local nearby  = require('openmw.nearby')
 
+local C = require('scripts/OMW_MagExp/magexp_constants')
+
 -- ---- State Management ----
 local busyUntil        = 0
 local hasQueuedLaunch  = false
@@ -321,7 +323,7 @@ local function handleCastResult(data)
         anim.playBlended(self, "spellcast", { priority = 1, blend = 0.2 })
     else
         debugLog("Cast Authorization: FAILED (Roll/Magicka)")
-        ui.showMessage("You failed casting the spell.")
+        ui.showMessage(C.MSG.SPELL_FAILED)
         pendingChargeKey = nil
     end
 end
@@ -494,7 +496,7 @@ local MagExp_PlayerInterface = {
                     })
                     return true
                 else
-                    ui.showMessage("You do not have enough of that item.")
+                    ui.showMessage(C.MSG.INSUFFICIENT_ITEMS)
                     return false
                 end
             else
@@ -521,7 +523,7 @@ local MagExp_PlayerInterface = {
                     })
                     return true
                 else
-                    ui.showMessage("You don't have enough charges in this item.")
+                    ui.showMessage(C.MSG.INSUFFICIENT_CHARGE)
                     return false
                 end
             end
@@ -531,7 +533,7 @@ local MagExp_PlayerInterface = {
                 magicka.current = magicka.current - cost
                 return true
             else
-                ui.showMessage("You do not have enough Magicka to cast the spell.")
+                ui.showMessage(C.MSG.INSUFFICIENT_MAGICKA)
                 return false
             end
         end

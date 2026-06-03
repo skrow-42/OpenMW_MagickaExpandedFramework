@@ -1,0 +1,2 @@
+MSG_INSUFFICIENT_ITEMS: You do not have enough of that item.
+MSG_ITEM_REQUIRED: You need %s to cast %s

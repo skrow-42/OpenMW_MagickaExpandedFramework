@@ -19,6 +19,8 @@ local storage = require('openmw.storage')
 local I       = require('openmw.interfaces')
 local async   = require('openmw.async')
 
+local C = require('scripts/OMW_MagExp/magexp_constants')
+
 local activeVfxRegistry      = {}
 local projectileItemRegistry = {} -- [proj.id] = live item object, kept until projectile dies
 local casterLinkedSpells     = {} -- list of {caster, target, spellId} for casterLinked effects
@@ -1957,7 +1959,7 @@ local function launchSpell(data)
             if not (resolvedItem and type(resolvedItem) ~= "string" and resolvedItem:isValid()) then
                 print("[MagExp] Enchantment failure: no valid enchanted item")
                 if attacker.type == types.Player then
-                    attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
+                    attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_CHARGE)
                 end
                 debugLog("Enchantment failure: no valid enchanted item for " .. tostring(spellId))
                 return
@@ -1973,7 +1975,7 @@ local function launchSpell(data)
                     })
                 else
                     if attacker.type == types.Player then
-                        attacker:sendEvent('Ui_ShowMessage', "You do not have enough of that item.")
+                        attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_ITEMS)
                     end
                     return
                 end
@@ -1995,7 +1997,7 @@ local function launchSpell(data)
                 end
                 if currentCharge < cost then
                     if attacker.type == types.Player then
-                        attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
+                        attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_CHARGE)
                     end
                     debugLog("Enchantment failure: " .. spellId .. " requires " .. cost .. " charges, has " .. currentCharge)
                     return
@@ -2019,7 +2021,7 @@ local function launchSpell(data)
             if magicka.current < cost then
                 print("[MagExp] Not enough magicka, returning early!")
                 if attacker.type == types.Player then
-                    attacker:sendEvent('Ui_ShowMessage', "You don't have enough magicka")
+                    attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_MAGICKA)
                 end
                 debugLog("Magicka failure: " .. spellId .. " requires " .. cost .. " magicka, has " .. magicka.current)
                 return
@@ -2051,9 +2053,9 @@ local function launchSpell(data)
         end
 
         local function showFail(itemId)
-            local itemName = getItemName(itemId)
-            local msg = string.format("You need %s to cast %s", itemName, spellName)
             if attacker.type == types.Player then
+                local itemName = getItemName(itemId)
+                local msg = string.format(C.MSG.ITEM_REQUIRED, itemName, spellName)
                 attacker:sendEvent('Ui_ShowMessage', msg)
             end
         end
