@@ -18,6 +18,7 @@ local async   = require('openmw.async')
 local nearby  = require('openmw.nearby')
 
 local C = require('scripts/OMW_MagExp/magexp_constants')
+local Helpers = require('scripts/OMW_MagExp/magexp_helpers')
 
 -- ---- State Management ----
 local busyUntil        = 0
@@ -473,6 +474,7 @@ local handlers = {
 -- [PUBLIC LOCAL API] For other player scripts
 -- ============================================================
 local MagExp_PlayerInterface = {
+    Helpers = Helpers,
     consumeSpellCost = function(spellId, itemObject)
         if debug.isGodMode() then return true end
         local spell = core.magic.spells.records[spellId]

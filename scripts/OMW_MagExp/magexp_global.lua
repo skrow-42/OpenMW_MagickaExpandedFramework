@@ -20,6 +20,7 @@ local I       = require('openmw.interfaces')
 local async   = require('openmw.async')
 
 local C = require('scripts/OMW_MagExp/magexp_constants')
+local Helpers = require('scripts/OMW_MagExp/magexp_helpers')
 
 local activeVfxRegistry      = {}
 local projectileItemRegistry = {} -- [proj.id] = live item object, kept until projectile dies
@@ -197,40 +198,6 @@ local function pickEffectIdForModify(activeEffects, candidates, extra)
         if ok and eff then return cid end
     end
     return candidates[1]
-end
-
--- ============================================================
--- [PORT] Morrowind Engine Success Formula (Binary Parity)
--- ============================================================
-local function calcSpellBaseSuccessChance(spell, actor)
-    local school = 0
-    if spell.effects and spell.effects[1] then school = spell.effects[1].school end
-    local skillValue = 0
-    if types.NPC.stats.skills[school] then
-        skillValue = types.Actor.stats.skills[school](actor).modified
-    end
-    local stats = types.Actor.stats
-    local willpower = stats.attributes.willpower(actor).modified
-    local luck = stats.attributes.luck(actor).modified
-    return (skillValue * 2) + (willpower / 5) + (luck / 10) - spell.cost
-end
-
-local function getSpellSuccessChance(spell, actor, isGodMode)
-    if spell.alwaysSucceedFlag then
-        return 100
-    end
-    
-    if isGodMode then return 100 end
-    if types.Actor.getEffect(actor, "silence") > 0 then return 0 end
-    local soundLevel = types.Actor.getEffect(actor, "sound")
-    local baseChance = calcSpellBaseSuccessChance(spell, actor)
-    local fatigue = types.Actor.stats.dynamic.fatigue(actor)
-    local fatigueTerm = 1.0
-    if fatigue.base > 0 then
-        fatigueTerm = 0.75 + 0.5 * (fatigue.current / fatigue.base)
-    end
-    local chance = (baseChance - soundLevel) * fatigueTerm
-    return math.max(0, math.min(100, math.floor(chance + 0.5)))
 end
 
 local heightCache = {}
@@ -2756,6 +2723,7 @@ end
 local MagExpPublicInterface = {
     --- Version of the OMW_MagExp framework.
     version = 1.0,
+    Helpers = Helpers,
 
     --- Launch a spell projectile (or apply Self/Touch immediately).
     -- @param data table: { attacker, spellId, startPos, direction, isFree?, speed? }
@@ -3264,11 +3232,16 @@ MagExp_ProcessCast = function(data)
     if not actor or not actor:isValid() then return end
 
     local spellId = data.spellId
-    local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
+    local isEnchant = false
+    local spell = core.magic.spells.records[spellId]
+    if not spell then
+        isEnchant = true
+        spell = core.magic.enchantments.records[spellId]
+    end
     if not spell then return end
 
-    local chance = getSpellSuccessChance(spell, actor, data.isGodMode)
-    local success = (chance >= 100) or (math.random(0, 99) < chance)
+    local chance = isEnchant and 100 or Helpers.getSpellCastChance(spellId, actor, data.isGodMode)
+    local success = chance > 0 and ((chance >= 100) or (math.random(0, 99) < chance))
 
     if not success then
         actor:sendEvent('MagExp_CastResult', { spellId = spellId, success = false })
