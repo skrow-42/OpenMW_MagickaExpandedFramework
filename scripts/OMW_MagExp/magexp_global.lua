@@ -21,6 +21,7 @@ local async   = require('openmw.async')
 
 local C = require('scripts/OMW_MagExp/magexp_constants')
 local Helpers = require('scripts/OMW_MagExp/magexp_helpers')
+local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp]')
 
 local activeVfxRegistry      = {}
 local projectileItemRegistry = {} -- [proj.id] = live item object, kept until projectile dies
@@ -66,10 +67,6 @@ local function checkTarget(target)
     end
 
     return true
-end
-
-local function debugLog(msg)
-    print("[MagExp] " .. tostring(msg))
 end
 
 local function playerNotifyCastIssue(actor, msg)
@@ -514,11 +511,11 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
 
     -- [DEAD ACTOR GATE] Must be first — before any VFX/sounds fire on the target
     if not checkTarget(target) then
-        debugLog("[MagExp] Target Vetoed (dead or filtered): " .. tostring(target.recordId or target.id))
+        debugLog("[MagExp] Target Vetoed (dead or filtered): ", tostring(target.recordId or target.id))
         return
     end
 
-    print("MagExp: Applying " .. spellId .. " to " .. (target.recordId or "unknown") .. " by " .. (caster.recordId or "unknown"))
+    debugLog("Applying " .. spellId .. " to " .. (target.recordId or "unknown") .. " by " .. (caster.recordId or "unknown"))
 
     local spell = core.magic.spells.records[spellId]
     local isEnchantment = false
@@ -562,7 +559,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
     end
 
     if not spell then
-        debugLog("applySpellToActor: record not found: " .. tostring(spellId))
+        debugLog("applySpellToActor: record not found:", tostring(spellId))
         return
     end
 
@@ -570,23 +567,23 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
     local hasCasterLinked = casterLinked or false
     if spell.effects then
         for _, eff in ipairs(spell.effects) do
-            print("MagExp: Checking effect " .. eff.id)
+            debugLog("Checking effect", eff.id)
             local mgef = core.magic.effects.records[eff.id]
             if mgef then
                 if mgef.harmful then
-                    print("MagExp: Detected harmful effect: " .. eff.id)
+                    debugLog("Detected harmful effect:", eff.id)
                     hasHarmful = true
                 end
                 if mgef.casterLinked then
-                    print("MagExp: Detected casterLinked effect: " .. eff.id)
+                    debugLog("Detected casterLinked effect:", eff.id)
                     hasCasterLinked = true
                 end
             else
-                print("MagExp: No mgef for " .. eff.id)
+                debugLog("No mgef for", eff.id)
             end
         end
     else
-        print("MagExp: No effects in spell")
+        debugLog("No effects in spell")
     end
 
     local effectIndexes = (forcedEffects and #forcedEffects > 0) and forcedEffects or nil
@@ -610,7 +607,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
     end
 
     if not effectIndexes or #effectIndexes == 0 then
-        debugLog("applySpellToActor: no eligible effects on this actor (after range gate) — " .. tostring(spellId))
+        debugLog("applySpellToActor: no eligible effects on this actor (after range gate) —", tostring(spellId))
         return
     end
 
@@ -670,14 +667,14 @@ if isPersistentLoop then
         if ok then
             debugLog("[Script Attach] Successfully attached (uppercase path)")
         else
-            debugLog("[Script Attach] Uppercase path failed: " .. tostring(err))
+            debugLog("[Script Attach] Uppercase path failed:", tostring(err))
             ok, err = pcall(function()
                 target:addScript('scripts/omw_magexp/magexp_actor_vfx.lua')
             end)
             if ok then
                 debugLog("[Script Attach] Successfully attached (lowercase path)")
             else
-                debugLog("[Script Attach] BOTH paths failed: " .. tostring(err))
+                debugLog("[Script Attach] BOTH paths failed:", tostring(err))
             end
         end
     end
@@ -844,7 +841,7 @@ end
                 local rawDuration = rawEff.duration or 0
                 -- Skip ALL duration-based effects — engine handles their cleanup
                 if rawDuration > 0 then
-                    debugLog("effect scale: skipping duration effect (would corrupt stats): " .. tostring(rawEff.id))
+                    debugLog("effect scale: skipping duration effect (would corrupt stats):", tostring(rawEff.id))
                 else
                     -- Instant effect: safe to scale via ae:modify because
                     -- there is no spell expiry event that will reverse it
@@ -926,12 +923,12 @@ end
             end
 
             if hasCasterLinked then
-                print("MagExp: Tracking casterLinked spell " .. spellId .. " on " .. target.recordId)
+                debugLog("Tracking casterLinked spell", spellId, "on", target.recordId)
                 table.insert(casterLinkedSpells, { caster = caster, target = target, spellId = spellId })
             end
         end
     end)
-    if not ok then debugLog("Spell Application Error: " .. tostring(err)) end
+    if not ok then debugLog("Spell Application Error:" , tostring(err)) end
 end
 
 local function getObjectCenter(obj)
@@ -1097,7 +1094,7 @@ local function handleDoorLockUnlock(spellId, caster, target)
                                 for _, obj in ipairs(target.cell:getAll()) do
                                     if obj:isValid() and obj.type == types.NPC and obj.recordId == ownerRecordId then
                                         victim = obj
-                                        debugLog("[DOOR] Found victim NPC: " .. tostring(victim.recordId))
+                                        debugLog("[DOOR] Found victim NPC:", tostring(victim.recordId))
                                         break
                                     end
                                 end
@@ -1107,7 +1104,7 @@ local function handleDoorLockUnlock(spellId, caster, target)
                                 local npcRecord = types.NPC.records[victim.recordId]
                                 if npcRecord and npcRecord.faction and npcRecord.faction ~= "" then
                                     factionId = npcRecord.faction
-                                    debugLog("[DOOR] Using NPC record faction: " .. factionId)
+                                    debugLog("[DOOR] Using NPC record faction:", factionId)
                                 end
                             end
                         else
@@ -1237,18 +1234,18 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                 -- [SFP FALLBACK] Progressive refinement to stay on-element
                 local lId = tostring(areaStaticId):lower()
                 if not (types.Static.records[lId] or types.Weapon.records[lId]) then
-                    debugLog("[DETONATE] Missing Area VFX: " .. tostring(areaStaticId) .. " -- checking Hit fallback")
+                    debugLog("[DETONATE] Missing Area VFX:", tostring(areaStaticId), " -- checking Hit fallback")
                     local hitId = areaStaticId:gsub("Area", "Hit")
                     if types.Static.records[hitId:lower()] or types.Weapon.records[hitId:lower()] then
                         areaStaticId = hitId
                     else
                         if not (types.Static.records[areaStaticId:lower()] or types.Weapon.records[areaStaticId:lower()]) then
-                            debugLog("[DETONATE] Missing Hit VFX: " .. tostring(areaStaticId) .. " -- falling back to generic Default")
+                            debugLog("[DETONATE] Missing Hit VFX:", tostring(areaStaticId), " -- falling back to generic Default")
                             areaStaticId = "VFX_DefaultArea"
                         end
                     end
                 end
-                debugLog("[DETONATE] Final VFX candidate: " .. tostring(areaStaticId))
+                debugLog("[DETONATE] Final VFX candidate:", tostring(areaStaticId))
 
                 -- Final check: Ensure we don't spawn nothing
                 local finalId = areaStaticId:lower()
@@ -1266,7 +1263,7 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                     debugLog(string.format("[DETONATE] Spawning VFX: %s at %s (Scale: %.2f)", tostring(rec.model), tostring(pos), scale))
                     world.vfx.spawn(rec.model, pos, { scale = scale, mwMagicVfx = false })
                 else
-                    debugLog("[DETONATE] ERROR: Missing or invalid model for static ID: " .. tostring(areaStaticId))
+                    debugLog("[DETONATE] ERROR: Missing or invalid model for static ID:", tostring(areaStaticId))
                 end
             end
 -- ✅ FIXED — replaces the broken playSound3d call at line 1163
@@ -1299,7 +1296,7 @@ if explosionSound and not muteAudio then
             core.sound.playSound3d(explosionSound, soundAnchor, { volume = 1.0 })
         end)
     else
-        debugLog("[DETONATE] No valid sound anchor found for: " .. tostring(explosionSound))
+        debugLog("[DETONATE] No valid sound anchor found for:", explosionSound)
     end
 end
         
@@ -1531,7 +1528,7 @@ local function autoDetectProjectileParams(spell, primaryEffectIndex)
         out.speed = effectSpeedMult * baseSpeed
     end
     
-    print(string.format("[MagExp] MagicEffect auto-detect: %s | Final Speed: %s", tostring(n), tostring(out.speed)))
+    debugLog(string.format("MagicEffect auto-detect: %s | Final Speed: %s", tostring(n), tostring(out.speed)))
 
     -- ---- Auto light draft from MagicEffect color ----
     -- [FEATURE 2] Mirror C++ addSpellCastGlow: derive bolt light color from mgef.color.
@@ -1640,7 +1637,7 @@ local function resolveCastVfxModel(mgef, school)
                 rec = types.Weapon.records[rid] or types.Weapon.records[rid:lower()]
             end
             if rec and rec.model then
-                debugLog("[VFX RESOLVER] Found valid model for candidate: " .. rid)
+                debugLog("[VFX RESOLVER] Found valid model for candidate:", rid)
                 return rec.model
             end
         end
@@ -1783,7 +1780,7 @@ local function spawnCastVfxForAllEffects(attacker, spell, spellId, opts)
     if opts.muteCastVfx then return end
 
     if not attacker.enabled then
-        debugLog("[CASTVFX] attacker not enabled, skipping cast VFX for " .. tostring(spellId))
+        debugLog("[CASTVFX] attacker not enabled, skipping cast VFX for", tostring(spellId))
         return
     end
 
@@ -1794,38 +1791,38 @@ local function spawnCastVfxForAllEffects(attacker, spell, spellId, opts)
     
 end
 local function launchSpell(data)
-    print("[MagExp] launchSpell called with spellId:", data.spellId)
+    debugLog("launchSpell called with spellId:", data.spellId)
     local attacker  = data.attacker
     local spellId   = data.spellId
     local itemObject = data.item or data.itemObject
     local startPos  = data.startPos
     local direction = data.direction
 
-    print("[MagExp] Parameter validation:")
-    print("  attacker:", attacker and (attacker:isValid() and "VALID" or "INVALID") or "NIL")
-    print("  spellId:", spellId and tostring(spellId) or "NIL")
-    print("  startPos:", startPos and tostring(startPos) or "NIL")
-    print("  direction:", direction and tostring(direction) or "NIL")
+    debugLog("Parameter validation:")
+    debugLog("  attacker:", attacker and (attacker:isValid() and "VALID" or "INVALID") or "NIL")
+    debugLog("  spellId:", spellId and tostring(spellId) or "NIL")
+    debugLog("  startPos:", startPos and tostring(startPos) or "NIL")
+    debugLog("  direction:", direction and tostring(direction) or "NIL")
     
     if not attacker or not spellId or not startPos or not direction then
         debugLog("launchSpell: missing required data (attacker, spellId, startPos, direction)")
-        print("[MagExp] EARLY RETURN - missing required parameters!")
+        debugLog("EARLY RETURN - missing required parameters!")
         --playerNotifyCastIssue(attacker, "Cast failed (invalid spell data).")
         return
     end
-    print("[MagExp] Parameter validation passed!")
+    debugLog("Parameter validation passed!")
 
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
-    print("[MagExp] Direct spell lookup result:", spell and "FOUND" or "NOT FOUND")
+    debugLog("Direct spell lookup result:", spell and "FOUND" or "NOT FOUND")
     
     -- Fallback: Iterative search if the proxy is numerically indexed
     if not spell then
-        print("[MagExp] Trying fallback iterative search...")
+        debugLog("Trying fallback iterative search...")
         for _, rec in pairs(core.magic.spells.records) do
             local ok, recId = pcall(function() return rec.id end)
             if ok and recId and tostring(recId):lower() == tostring(spellId):lower() then
                 spell = rec
-                print("[MagExp] Found spell in fallback search!")
+                debugLog("Found spell in fallback search!")
                 break
             end
         end
@@ -1835,7 +1832,7 @@ local function launchSpell(data)
             local ok, recId = pcall(function() return rec.id end)
             if ok and recId and tostring(recId):lower() == tostring(spellId):lower() then
                 spell = rec
-                print("[MagExp] Found spell in fallback search!")
+                debugLog("Found spell in fallback search!")
                 break
             end
         end
@@ -1855,7 +1852,7 @@ local function launchSpell(data)
             end
         end
         if effRec then
-            print("[MagExp] Found '" .. spellId .. "' as a magic effect — synthesizing spell wrapper")
+            debugLog("Found '" .. spellId .. "' as a magic effect — synthesizing spell wrapper")
             spell = {
                 id      = spellId,
                 cost    = 0,
@@ -1867,19 +1864,19 @@ local function launchSpell(data)
     end
 
     if not spell then
-        print("[MagExp] launchSpell ERROR: spell/enchantment record not found: " .. tostring(spellId))
+        debugLog("launchSpell ERROR: spell/enchantment record not found: " .. tostring(spellId))
         --playerNotifyCastIssue(attacker, "You cannot cast that spell.")
         return
     end
-    print("[MagExp] Spell record found successfully!")
+    debugLog("Spell record found successfully!")
 -- ===================================================================
 -- [CAST VFX + SOUND] Spawn for ALL unique schools, right at cast start
 -- ===================================================================
 
     -- [FEATURE 4] nonRecastable: silently abort if spell is already active on the caster.
-    print("[MagExp] Checking nonRecastable...")
+    debugLog("Checking nonRecastable...")
     if data.nonRecastable then
-        print("[MagExp] nonRecastable is TRUE, checking active spells...")
+        debugLog("nonRecastable is TRUE, checking active spells...")
         local isActive = false
         pcall(function()
             local as = types.Actor.activeSpells(attacker)
@@ -1893,21 +1890,20 @@ local function launchSpell(data)
             end
         end)
         if isActive then
-            print("[MagExp] Spell is already active, aborting cast")
-            debugLog("nonRecastable: " .. spellId .. " already active on caster — aborting.")
+            debugLog("nonRecastable:", spellId, "already active on caster — aborting.")
             return
         else
-            print("[MagExp] nonRecastable: spell is not active on caster")
+            debugLog("nonRecastable: spell is not active on caster")
         end
     else
-        print("[MagExp] nonRecastable is FALSE or not set")
+        debugLog("nonRecastable is FALSE or not set")
     end
-    print("[MagExp] nonRecastable check passed!")
+    debugLog("nonRecastable check passed!")
 
     -- [RESOURCE GUARD] (skipped when isFree = true)
-    print("[MagExp] Checking resource guard, isFree:", data.isFree, "isGodMode:", data.isGodMode)
+    debugLog("Checking resource guard, isFree:", data.isFree, "isGodMode:", data.isGodMode)
     if not data.isFree and not data.isGodMode then
-        print("[MagExp] Resource guard: checking costs and resources...")
+        debugLog("Resource guard: checking costs and resources...")
         local cost = spell.cost or 0
         local isEnchantment = core.magic.enchantments.records[spellId] ~= nil
         local resolvedItem = itemObject
@@ -1922,16 +1918,16 @@ local function launchSpell(data)
         end
 
         if isEnchantment then
-            print("[MagExp] Spell is enchantment, checking item...")
+            debugLog("Spell is enchantment, checking item...")
             if not (resolvedItem and type(resolvedItem) ~= "string" and resolvedItem:isValid()) then
-                print("[MagExp] Enchantment failure: no valid enchanted item")
+                debugLog("Enchantment failure: no valid enchanted item")
                 if attacker.type == types.Player then
                     attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_CHARGE)
                 end
-                debugLog("Enchantment failure: no valid enchanted item for " .. tostring(spellId))
+                debugLog("Enchantment failure: no valid enchanted item for", tostring(spellId))
                 return
             end
-            print("[MagExp] Enchantment item validation passed!")
+            debugLog("Enchantment item validation passed!")
             if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
                 -- Scroll / Cast Once Check: Consume 1 item
                 if resolvedItem.count > 0 then
@@ -1966,7 +1962,7 @@ local function launchSpell(data)
                     if attacker.type == types.Player then
                         attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_CHARGE)
                     end
-                    debugLog("Enchantment failure: " .. spellId .. " requires " .. cost .. " charges, has " .. currentCharge)
+                    debugLog("Enchantment failure:", spellId, "requires", cost, "charges, has", currentCharge)
                     return
                 end
                 -- [DEDUCTION] (global script — required for item charge writes)
@@ -1979,18 +1975,18 @@ local function launchSpell(data)
             itemObject = resolvedItem
         else
             -- Magicka Check
-            print("[MagExp] Checking magicka cost...")
+            debugLog("Checking magicka cost...")
             local magicka = (attacker.type == types.Player)
                 and types.Player.stats.dynamic.magicka(attacker)
                 or  types.Actor.stats.dynamic.magicka(attacker)
-            print("[MagExp] Current magicka:", magicka and magicka.current or "NIL", "Cost:", cost)
-            print("[MagExp] Comparison: magicka.current < cost =", magicka and magicka.current or "NIL", "<", cost)
+            debugLog("Current magicka:", magicka and magicka.current or "NIL", "Cost:", cost)
+            debugLog("Comparison: magicka.current < cost =", magicka and magicka.current or "NIL", "<", cost)
             if magicka.current < cost then
-                print("[MagExp] Not enough magicka, returning early!")
+                debugLog("Not enough magicka, returning early!")
                 if attacker.type == types.Player then
                     attacker:sendEvent('Ui_ShowMessage', C.MSG.INSUFFICIENT_MAGICKA)
                 end
-                debugLog("Magicka failure: " .. spellId .. " requires " .. cost .. " magicka, has " .. magicka.current)
+                debugLog("Magicka failure:", spellId, "requires", cost, "magicka, has", magicka.current)
                 return
             end
             -- [DEDUCTION]
@@ -2001,9 +1997,9 @@ local function launchSpell(data)
     end
     
     -- [ITEM REQUIREMENTS]
-    print("[MagExp] Checking item requirements...")
+    debugLog("Checking item requirements...")
     if data.itemRequirements and types.Actor.objectIsInstance(attacker) then
-        print("[MagExp] Item requirements found, checking...")
+        debugLog("Item requirements found, checking...")
         local inv = types.Actor.inventory(attacker)
         local spellName = (spell and spell.name) or spellId
         
@@ -2050,22 +2046,22 @@ local function launchSpell(data)
             end
         end
     end
-    print("[MagExp] Item requirements check passed!")
+    debugLog("Item requirements check passed!")
     -- Spawn cast-start VFX for ALL effects (works even when OSSC calls MagExp_CastRequest directly)
     spawnCastVfxForAllEffects(attacker, spell, spellId, {
         muteCastVfx = data.muteCastVfx or false,
     })
     local effectScale = coerceEffectScale(data.effectScale)
-    print("[MagExp] Effect scale:", effectScale)
+    debugLog("Effect scale:", effectScale)
 
     -- Partition by per-effect range: Self only on caster; Touch only on hitObject; Target only via projectile indices.
-    print("[MagExp] Partitioning spell effects...")
+    debugLog("Partitioning spell effects...")
     local selfIndexes, touchIndexes, targetIndexes = {}, {}, {}
     if spell.effects then
-        print("[MagExp] Spell has", #spell.effects, "effects")
+        debugLog("Spell has", #spell.effects, "effects")
         for i, eff in ipairs(spell.effects) do
             local ix = i - 1
-            print("[MagExp] Effect", i, "range:", eff.range)
+            debugLog("Effect", i, "range:", eff.range)
             if spellEffectRangeIsSelf(eff.range) then
                 table.insert(selfIndexes, ix)
             elseif eff.range == core.magic.RANGE.Touch then
@@ -2075,9 +2071,9 @@ local function launchSpell(data)
             end
         end
     else
-        print("[MagExp] Spell has no effects!")
+        debugLog("Spell has no effects!")
     end
-    print("[MagExp] Effects partitioned - Self:", #selfIndexes, "Touch:", #touchIndexes, "Target:", #targetIndexes)
+    debugLog("Effects partitioned - Self:", #selfIndexes, "Touch:", #touchIndexes, "Target:", #targetIndexes)
 
     local function casterTorsoPosition()
         local zOffset = 95
@@ -2163,10 +2159,10 @@ local function launchSpell(data)
             end
 
             if spellIsLockUnlock then
-                debugLog("[TOUCH] Calling handleDoorLockUnlock for: " .. tostring(obj.recordId))
+                debugLog("[TOUCH] Calling handleDoorLockUnlock for:", tostring(obj.recordId))
                 handleDoorLockUnlock(spellId, attacker, obj)
             elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
-                debugLog("[TOUCH] Applying spell to actor: " .. tostring(obj.recordId))
+                debugLog("[TOUCH] Applying spell to actor:", tostring(obj.recordId))
                 if touchArea > 0 then
                     detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale)
                 end
@@ -2345,11 +2341,11 @@ for gi, group in ipairs(schoolGroups) do
         rotation = util.transform.rotateZ(yaw) * util.transform.rotateX(-pitch)
     end
 
-    debugLog("[MagExp] Attempting to create projectile with recordId: " .. tostring(recordId))
+    debugLog("Attempting to create projectile with recordId:", tostring(recordId))
     local proj = world.createObject(recordId, 1)
-    debugLog("[MagExp] Created projectile object: " .. tostring(proj and proj.id or "NIL"))
+    debugLog("Created projectile object:", tostring(proj and proj.id or "NIL"))
     if not proj or not proj:isValid() then
-        debugLog("[MagExp] ERROR: Failed to create valid projectile object for bolt " .. tostring(gi))
+        debugLog("ERROR: Failed to create valid projectile object for bolt", tostring(gi))
     else
         proj:teleport(attacker.cell, spawnPos, rotation)
 
@@ -2628,7 +2624,7 @@ local function onUpdate(dt)
     local vfxTag = regData.vfxTag
     
     if not actor or not actor:isValid() then
-        debugLog("[continuousVFX Registry] Removing invalid actor: " .. actorId)
+        debugLog("[continuousVFX Registry] Removing invalid actor:", actorId)
         continuousVfxActors[actorId] = nil
      else
         local isActive = false
@@ -2653,7 +2649,7 @@ local function onUpdate(dt)
             end)
             
             continuousVfxActors[actorId] = nil
-            debugLog("[continuousVFX Registry] Unregistered actor: " .. actorId)
+            debugLog("[continuousVFX Registry] Unregistered actor:", actorId)
         end
     end
 end
@@ -3017,8 +3013,8 @@ return {
         --- Main spell launch event. Usable from player scripts via core.sendGlobalEvent.
         MagExp_CastRequest         = function(data) launchSpell(data) end,
         MagExp_ProjectileMove      = onProjectileMove,
-        MagExp_ProjectileExpired   = function(data) print("[MagExp] Projectile EXPIRED: " .. tostring(data.spellId or "nil")); onProjectileExpired(data) end,
-        MagExp_ProjectileCollision = function(data) print("[MagExp] Projectile COLLISION: " .. tostring(data.spellId or "nil") .. " with " .. tostring(data.hitObject or "world")); onProjectileCollision(data) end,
+        MagExp_ProjectileExpired   = function(data) debugLog("Projectile EXPIRED: " .. tostring(data.spellId or "nil")); onProjectileExpired(data) end,
+        MagExp_ProjectileCollision = function(data) debugLog("Projectile COLLISION: " .. tostring(data.spellId or "nil") .. " with " .. tostring(data.hitObject or "world")); onProjectileCollision(data) end,
 
         --- Bounce event: forwarded from local script on each wall reflection.
         MagExp_OnProjectileBounce  = function(data)
@@ -3127,7 +3123,7 @@ MagExp_CastStart = function(data)
         end
     end
     if not spell or not spell.effects then
-        debugLog("[CASTSTART] No spell/effects for " .. tostring(spellId))
+        debugLog("[CASTSTART] No spell/effects for", spellId)
         return
     end
 

@@ -1,2 +1,10 @@
+SettingsPageTitle: Spell Framework Plus 1.82
+SettingsPageDescription: Framework settings for OMW Spell Framework Plus
+
+SettingsGeneralTitle: General
+
+SettingsDebugModeTitle: Debug Mode
+SettingsDebugModeDescription: Enable to see framework logs in the console (F10).
+
 MSG_INSUFFICIENT_ITEMS: You do not have enough of that item.
 MSG_ITEM_REQUIRED: You need %s to cast %s

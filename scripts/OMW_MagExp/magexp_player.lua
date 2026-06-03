@@ -7,7 +7,6 @@ local self    = require('openmw.self')
 local core    = require('openmw.core')
 local types   = require('openmw.types')
 local anim    = require('openmw.animation')
-local input   = require('openmw.input')
 local storage = require('openmw.storage')
 local ui      = require('openmw.ui')
 local camera  = require('openmw.camera')
@@ -19,6 +18,8 @@ local nearby  = require('openmw.nearby')
 
 local C = require('scripts/OMW_MagExp/magexp_constants')
 local Helpers = require('scripts/OMW_MagExp/magexp_helpers')
+local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp-Player]')
+
 
 -- ---- State Management ----
 local busyUntil        = 0
@@ -34,19 +35,11 @@ local pendingChargeKey = nil
 -- ============================================================
 -- [OSSC DETECTION] Optional OSSC integration
 -- ============================================================
-local IS_OSSC_LOADED = false
+local IS_OSSC_DEBUG = false
 pcall(function()
     local s = storage.playerSection('SettingsOSSC_General')
-    IS_OSSC_LOADED = (s ~= nil and s:get('DebugMode') ~= nil)
+    IS_OSSC_DEBUG = (s ~= nil and s:get('DebugMode') == true)
 end)
-
-local function debugLog(msg)
-    if not IS_OSSC_LOADED then return end
-    local section = storage.playerSection('SettingsOSSC_General')
-    if section and section:get('DebugMode') then
-        print("[MagExp-Player] " .. tostring(msg))
-    end
-end
 
 -- ============================================================
 -- [CAST START GROUP WHITELIST]
@@ -82,7 +75,7 @@ local function isWhitelistedCastGroup(groupname)
 end
 
 local function sendCastStartNow(reason, groupname)
-    if IS_OSSC_LOADED then
+    if IS_OSSC_DEBUG then --TODO: is this needed?
         debugLog("OSSC active - sending CastStart from MagExp for group: " .. tostring(groupname))
     end
 
@@ -99,8 +92,7 @@ local function sendCastStartNow(reason, groupname)
     lastCastStartSentTime = t
     lastCastStartSpellId  = spellId
 
-    print(string.format("[MagExp-Player] CastStart (%s): group=%s spellId=%s",
-        tostring(reason), tostring(groupname), tostring(spellId)))
+    debugLog(string.format("CastStart (%s): group=%s spellId=%s", tostring(reason), tostring(groupname), tostring(spellId)))
 
     core.sendGlobalEvent('MagExp_CastStart', {
         attacker = self,
@@ -126,39 +118,39 @@ local function calculateLaunchPayload(spell, item)
         startPos  = startPos + camera.getLeft() * 25
     end
 
-    print("[MagExp-Player] Starting raycast from: " .. tostring(startPos))
-    print("[MagExp-Player] Direction: " .. tostring(direction))
+    debugLog("Starting raycast from:", startPos)
+    debugLog("Direction:", direction)
 
     local hitObject = nil
     local hitPos    = nil
 
     local rayOk, rayErr = pcall(function()
         local endPos = startPos + direction * 300
-        print("[MagExp-Player] Ray end position: " .. tostring(endPos))
+         debugLog("Ray end position:", endPos)
 
         local rayResult = nearby.castRay(startPos, endPos, { ignore = self })
-        print("[MagExp-Player] Raycast result: " .. tostring(rayResult))
+         debugLog("Raycast result:", rayResult)
 
         if rayResult then
-            print("[MagExp-Player] Ray hit something!")
-            print("[MagExp-Player] hitObject: " .. tostring(rayResult.hitObject))
-            print("[MagExp-Player] hitPos: " .. tostring(rayResult.hitPos))
+             debugLog("Ray hit something!")
+             debugLog("hitObject:", rayResult.hitObject)
+             debugLog("hitPos:", rayResult.hitPos)
             if rayResult.hitObject then
                 hitObject = rayResult.hitObject
                 hitPos    = rayResult.hitPos
-                print("[MagExp-Player] Hit object type: " .. tostring(hitObject.type))
-                print("[MagExp-Player] Hit object recordId: " .. tostring(hitObject.recordId))
+                 debugLog("Hit object type:", hitObject.type)
+                 debugLog("Hit object recordId:", hitObject.recordId)
             end
         else
-            print("[MagExp-Player] Raycast returned nil")
+             debugLog("Raycast returned nil")
         end
     end)
 
     if not rayOk then
-        print("[MagExp-Player] Raycast ERROR: " .. tostring(rayErr))
+         debugLog("Raycast ERROR:", rayErr)
     end
 
-    print("[MagExp-Player] Final hitObject for payload: " .. tostring(hitObject))
+     debugLog("Final hitObject for payload:", hitObject)
 
     return {
         attacker   = self,
@@ -371,20 +363,20 @@ local handlers = {
 
             local skillId = skillMap[data.school:lower()]
             if not skillId then
-                print("[MagExp-Player] Unknown school for skill progression: " .. tostring(data.school))
+                debugLog("Unknown school for skill progression:", tostring(data.school))
                 return
             end
 
             local skillStat = types.Player.stats.skills[skillId]
             if not skillStat then
-                print("[MagExp-Player] Skill stat not found for: " .. skillId)
+                debugLog("Skill stat not found for:", skillId)
                 return
             end
 
             local stat = skillStat(self)
             if stat and stat.progress ~= nil then
                 stat.progress = stat.progress + data.progress
-                print(string.format("[MagExp-Player] Awarded %.2f progress to %s", data.progress, skillId))
+                debugLog(string.format("Awarded %.2f progress to %s", data.progress, skillId))
             end
         end,
 
@@ -395,7 +387,7 @@ local handlers = {
             local mask     = data.blendMask or 15
             local priority = data.priority  or 7
 
-            debugLog("MagExp_PlaySpellAnim: " .. group .. " (priority=" .. priority .. " mask=" .. mask .. ")")
+            debugLog("PlaySpellAnim: " .. group .. " (priority=" .. priority .. " mask=" .. mask .. ")")
             anim.play(self, group, priority, mask, false, 1.0)
 
             if data.isCharged then
@@ -406,7 +398,7 @@ local handlers = {
                     blendMask  = mask,
                     isCharging = true,
                 }
-                debugLog("Charged spell started: " .. group .. " key=" .. tostring(data.chargeKey))
+                debugLog("Charged spell started:", group, "key=", tostring(data.chargeKey))
             end
         end,
 
@@ -428,7 +420,7 @@ local handlers = {
         -- VFX Utilities
         AddVfx = function(data)
             if not data or not data.model then return end
-            print(string.format("[MagExp-Player] AddVfx model=%s vfxId=%s bone=%s",
+            debugLog(string.format("AddVfx model=%s vfxId=%s bone=%s",
                 tostring(data.model),
                 tostring(data.options and data.options.vfxId),
                 tostring(data.options and data.options.boneName)
