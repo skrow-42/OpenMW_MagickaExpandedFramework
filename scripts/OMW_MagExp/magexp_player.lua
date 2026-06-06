@@ -444,6 +444,7 @@ local handlers = {
         -- Resource consumption
         MagExp_ConsumeResource = function(data)
             pcall(function()
+                debugLog('ConsumeResource: magicka:', data.magickaCost, ', items:', data.itemCountCost)
                 if data.magickaCost then
                     local magicka = types.Actor.stats.dynamic.magicka(self)
                     magicka.current = math.max(0, magicka.current - data.magickaCost)
@@ -476,8 +477,8 @@ local MagExp_PlayerInterface = {
             isEnchantment = spell ~= nil
         end
         if not spell then return true end
-        local cost = spell.cost or 0
-        if cost <= 0 then return true end
+        local cost = Helpers.getModifiedSpellCost(self, spellId, isEnchantment) --TODO: add option to override the spell cost?
+        if cost <= 0 and spell.type ~= core.magic.ENCHANTMENT_TYPE.CastOnce then return true end
 
         if isEnchantment and itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
             if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
@@ -494,9 +495,6 @@ local MagExp_PlayerInterface = {
                     return false
                 end
             else
-                local skill = 0
-                pcall(function() skill = types.Player.stats.skills.enchant(self).modified end)
-                cost = math.max(1, math.floor(0.01 * (110 - skill) * cost))
                 local currentCharge, haveCharge = 0, false
                 pcall(function()
                     local itemData = types.Item.itemData(itemObject)

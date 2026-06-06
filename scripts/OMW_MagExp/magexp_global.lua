@@ -1904,8 +1904,8 @@ local function launchSpell(data)
     debugLog("Checking resource guard, isFree:", data.isFree, "isGodMode:", data.isGodMode)
     if not data.isFree and not data.isGodMode then
         debugLog("Resource guard: checking costs and resources...")
-        local cost = spell.cost or 0
         local isEnchantment = core.magic.enchantments.records[spellId] ~= nil
+        local cost = data.overrideCost or Helpers.getModifiedSpellCost(attacker, spellId, isEnchantment)
         local resolvedItem = itemObject
         if isEnchantment then
             local inv = types.Actor.inventory(attacker)
@@ -1943,17 +1943,6 @@ local function launchSpell(data)
                     return
                 end
             else
-                -- Enchantment Charge Check: Scale cost based on Enchant skill
-                local skill = 0
-                pcall(function()
-                    if attacker.type == types.Player then
-                        skill = types.Player.stats.skills.enchant(attacker).modified
-                    elseif attacker.type == types.NPC then
-                        skill = types.NPC.stats.skills.enchant(attacker).modified
-                    end
-                end)
-                cost = math.max(1, math.floor(0.01 * (110 - skill) * cost))
-                
                 local currentCharge, haveCharge = magExpReadItemEnchantmentCharge(resolvedItem)
                 if not haveCharge then
                     currentCharge = spell.charge or 0
@@ -3235,8 +3224,8 @@ MagExp_ProcessCast = function(data)
         spell = core.magic.enchantments.records[spellId]
     end
     if not spell then return end
-
-    local chance = isEnchant and 100 or Helpers.getSpellCastChance(spellId, actor, data.isGodMode)
+    --TODO: add option to override the spell cost and affect cast chance?
+    local chance = isEnchant and 100 or Helpers.getSpellCastChance(spellId, actor, {isGodMode = data.isGodMode})
     local success = chance > 0 and ((chance >= 100) or (math.random(0, 99) < chance))
 
     if not success then

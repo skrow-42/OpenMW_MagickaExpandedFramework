@@ -67,8 +67,9 @@ end
 --- 
 ---@param spellId string
 ---@param actor table
----@param isGodMode boolean 
-Helpers.getSpellCastChance = function(spellId, actor, isGodMode)
+---@param opts? {isGodMode?: boolean, cost?: number} 
+Helpers.getSpellCastChance = function(spellId, actor, opts)
+    local isGodMode = opts and opts.isGodMode
     local spellRecord = core.magic.spells.records[spellId]
     if not spellRecord then return 0 end
     
@@ -129,6 +130,9 @@ Helpers.getSpellCastChance = function(spellId, actor, isGodMode)
             return 100, effectiveSchool
         end
 
+        --try get overridden cost from opts
+        cost = opts and opts.cost or cost
+        
         local magicka = actor.type.stats.dynamic.magicka(actor)
         local willpower = actor.type.stats.attributes.willpower(actor)
         local luck = actor.type.stats.attributes.luck(actor)
