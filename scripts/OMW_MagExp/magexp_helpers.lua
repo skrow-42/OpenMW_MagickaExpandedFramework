@@ -67,7 +67,7 @@ end
 --- 
 ---@param spellId string
 ---@param actor table
----@param opts? {isGodMode?: boolean, cost?: number} 
+---@param opts? {isGodMode?: boolean, cost?: number, ignoreFatigue? : boolean} 
 Helpers.getSpellCastChance = function(spellId, actor, opts)
     local isGodMode = opts and opts.isGodMode
     local spellRecord = core.magic.spells.records[spellId]
@@ -142,7 +142,8 @@ Helpers.getSpellCastChance = function(spellId, actor, opts)
         end
 
         local castBonus = -activeEffects:getEffect(core.magic.EFFECT_TYPE.Sound).magnitude
-        local castChance = (lowestSkill - util.round(cost) + castBonus + 0.2 * willpower.modified + 0.1 * luck.modified) * Helpers.getFatigueTerm(actor)
+        local fatigueTerm = opts and opts.ignoreFatigue and 1 or Helpers.getFatigueTerm(actor)
+        local castChance = (lowestSkill - util.round(cost) + castBonus + 0.2 * willpower.modified + 0.1 * luck.modified) * fatigueTerm
 
         return math.floor(util.clamp(castChance, 0.0, 100.0)), effectiveSchool
     end
