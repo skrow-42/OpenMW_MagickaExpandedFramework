@@ -64,6 +64,7 @@ local vfxTriggeredThisCast = false
 local lastCastStartSentTime = -999
 local lastCastStartSpellId  = nil
 local pendingCastSpellId = nil
+local hasPendingCastSpellId = false
 
 local function shouldTriggerVfxOnStart(groupname)
     local g = tostring(groupname or ""):lower()
@@ -81,8 +82,11 @@ local function sendCastStartNow(reason, groupname)
     end
 
     local t = core.getSimulationTime()
-    local spellId = pendingCastSpellId
-    if not spellId then
+    local spellId
+    if hasPendingCastSpellId then
+        spellId = pendingCastSpellId
+        hasPendingCastSpellId = false
+    else
         local _, spell = pcall(types.Actor.getSelectedSpell, self)
         spellId = spell and spell.id
     end
@@ -354,11 +358,9 @@ local handlers = {
         --- This event sets spell id that is used later to display VFX around the player.
         --- Without it VFX is based on currently equipped spell, which is OK for most cases. 
         MagExp_SetPendingCastSpellId = function(evt)
-            local spellId = evt and evt.spellId
-            if not spellId then return end
-
-            pendingCastSpellId = spellId
-            debugLog("Set pendingCastSpellId:", spellId)
+            pendingCastSpellId = evt and evt.spellId
+            hasPendingCastSpellId = true
+            debugLog("Set pendingCastSpellId:", pendingCastSpellId)
         end,
 
         -- [SKILL] Progression from global script
