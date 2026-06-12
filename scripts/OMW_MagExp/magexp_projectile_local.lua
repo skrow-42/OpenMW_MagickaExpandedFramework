@@ -13,6 +13,8 @@ local util   = require('openmw.util')
 local anim   = require('openmw.animation')
 local types  = require('openmw.types')
 
+local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp Proj]')
+
 -- ---- Core state ----
 local velocity        = nil
 local attacker        = nil
@@ -170,13 +172,13 @@ local function onInit(data)
         -- Spawns ALL unique bolt VFX models simultaneously on the projectile.
         -- ============================================================
         if data.boltModels and #data.boltModels > 0 then
-            print(string.format("[MagExp] Layering %d bolt VFX models on projectile", #data.boltModels))
+            debugLog(string.format("Layering %d bolt VFX models on projectile", #data.boltModels))
             
             for i, model in ipairs(data.boltModels) do
                 local vfxId = string.format("MagExpBolt_%s_%d", tostring(self.id), i)
                 local particle = (data.particleTextures and data.particleTextures[i]) or ""
-                
-                print(string.format("[MagExp] Adding VFX layer %d/%d: model=%s particle=%s vfxId=%s",
+
+                debugLog(string.format("Adding VFX layer %d/%d: model=%s particle=%s vfxId=%s",
                     i, #data.boltModels, tostring(model), tostring(particle), vfxId))
                 
                 local opts = {
@@ -198,7 +200,7 @@ local function onInit(data)
             -- Fallback: single VFX (backward compatibility with old spells/mods)
             boltVfxId = vfxRecId or ("MagExp_Bolt_" .. tostring(self.id))
 
-            print(string.format("[MagExp] Adding single projectile bolt VFX: model=%s vfxId=%s",
+            debugLog(string.format("Adding single projectile bolt VFX: model=%s vfxId=%s",
                 tostring(data.boltModel), tostring(boltVfxId)))
 
             local opts = {

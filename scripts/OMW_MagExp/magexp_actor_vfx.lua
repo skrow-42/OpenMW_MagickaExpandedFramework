@@ -5,9 +5,7 @@
 local self = require('openmw.self')
 local anim = require('openmw.animation')
 
-local function debugLog(msg)
-    print("[MagExp VFX Actor] " .. tostring(msg))
-end
+local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp VFX Actor]')
 
 return {
     engineHandlers = {

@@ -1,5 +1,6 @@
+MENU: scripts/OMW_MagExp/magexp_settings_menu.lua
 GLOBAL: scripts/OMW_MagExp/magexp_global.lua
-PLAYER: scripts/OMW_MagExp/magexp_settings.lua
+GLOBAL: scripts/OMW_MagExp/magexp_settings.lua
 CUSTOM: scripts/OMW_MagExp/magexp_projectile_local.lua
 CUSTOM: scripts/OMW_MagExp/magexp_actor_vfx.lua
 PLAYER: scripts/OMW_MagExp/magexp_player.lua
